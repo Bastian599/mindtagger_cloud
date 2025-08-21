@@ -1,8 +1,8 @@
-# app.py — Jira Stichwort-Zuordnung PRO v4.1 (Cloud, per-user Cookies + DB)
-# Changes in 4.1:
-# - Cookie warmup (prevents re-login after tab close/reopen)
-# - Auto-Connect runs after warmup using cookie.get_all()
-# - st.stop only after sidebar handlers
+# app.py — Jira Stichwort-Zuordnung PRO v4.2 (Cloud)
+# New in 4.2:
+# - Robust client storage: try extra_streamlit_components.CookieManager,
+#   fall back to browser localStorage via streamlit_js_eval if the component cannot load.
+# - Unique keys for all cookie ops; warmup + rerun only when CookieManager is active.
 
 import os, re, io, time, json, base64
 from typing import List, Dict, Any, Optional, Tuple
@@ -13,9 +13,8 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from cryptography.fernet import Fernet
-import extra_streamlit_components as stx
 
-st.set_page_config(page_title="Jira Stichwort-Zuordnung PRO v4.1 — Cloud", layout="wide")
+st.set_page_config(page_title="Jira Stichwort-Zuordnung PRO v4.2 — Cloud", layout="wide")
 
 # ----------------------------- Secrets & Defaults -----------------------------
 def _sec(name: str, default: str = "") -> str:
@@ -31,71 +30,61 @@ if not FERNET_KEY:
 engine = create_engine(DB_URL, pool_pre_ping=True)
 cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
 
-# Cookie-Manager mit festem Key
-cookie = stx.CookieManager(key="cookie_mgr_v1")
+# ----------------------------- Client storage (Cookie or LocalStorage) --------
+STORAGE_MODE = None  # "cookie" | "localstorage" | None
+cookie = None
+local_get = local_set = local_remove = None
 
-# --- Cookie-Warmup: Erstes Render initialisiert Cookies, dann sofort rerun ---
-if "cookies_warmed" not in st.session_state:
-    cookie.get_all(key="warmup_all")  # Frontend initialisiert Cookie-Bridge
+try:
+    import extra_streamlit_components as stx  # type: ignore
+    cookie = stx.CookieManager(key="cookie_mgr_v2")
+    STORAGE_MODE = "cookie"
+except Exception:
+    try:
+        from streamlit_js_eval import get_local_storage, set_local_storage, remove_local_storage  # type: ignore
+        local_get, local_set, local_remove = get_local_storage, set_local_storage, remove_local_storage
+        STORAGE_MODE = "localstorage"
+    except Exception:
+        STORAGE_MODE = None
+
+# Warmup for CookieManager only
+if STORAGE_MODE == "cookie" and "cookies_warmed" not in st.session_state:
+    try:
+        cookie.get_all(key="warmup_all")
+    except Exception:
+        pass
     st.session_state["cookies_warmed"] = True
     st.rerun()
-# -----------------------------------------------------------------------------
 
-def enc_to_str(s: str) -> str:
-    return base64.b64encode(cipher.encrypt(s.encode())).decode()
+def storage_get_user() -> Optional[str]:
+    try:
+        if STORAGE_MODE == "cookie":
+            cookies = cookie.get_all(key="read_all") or {}
+            return cookies.get("jira_user")
+        elif STORAGE_MODE == "localstorage":
+            return local_get("jira_user")
+    except Exception:
+        return None
+    return None
 
-def dec_from_str(txt: str) -> str:
-    return cipher.decrypt(base64.b64decode(txt.encode())).decode()
+def storage_set_user(account_id: str):
+    try:
+        if STORAGE_MODE == "cookie":
+            exp = (datetime.now(timezone.utc) + timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+            cookie.set("jira_user", account_id, expires=exp, key="set_jira_user")
+        elif STORAGE_MODE == "localstorage":
+            local_set("jira_user", account_id)
+    except Exception:
+        pass
 
-def db_init():
-    with engine.begin() as con:
-        con.execute(text("""
-        CREATE TABLE IF NOT EXISTS user_credentials (
-          account_id     TEXT PRIMARY KEY,
-          jira_base_url  TEXT NOT NULL,
-          email          TEXT NOT NULL,
-          enc_token      TEXT NOT NULL,
-          created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """))
-db_init()
-
-def save_creds(account_id: str, base_url: str, email: str, api_token: str):
-    with engine.begin() as con:
-        con.execute(text("""
-        INSERT INTO user_credentials (account_id, jira_base_url, email, enc_token, updated_at)
-        VALUES (:aid, :url, :mail, :tok, CURRENT_TIMESTAMP)
-        ON CONFLICT (account_id) DO UPDATE SET
-          jira_base_url = EXCLUDED.jira_base_url,
-          email        = EXCLUDED.email,
-          enc_token    = EXCLUDED.enc_token,
-          updated_at   = CURRENT_TIMESTAMP
-        """), {"aid": account_id, "url": base_url, "mail": email, "tok": enc_to_str(api_token)})
-
-def load_creds(account_id: str):
-    with engine.begin() as con:
-        row = con.execute(text("""
-          SELECT jira_base_url, email, enc_token
-          FROM user_credentials WHERE account_id=:aid
-        """), {"aid": account_id}).fetchone()
-    if not row: return None
-    return {"base_url": row[0], "email": row[1], "api_token": dec_from_str(row[2])}
-
-def delete_creds(account_id: str):
-    with engine.begin() as con:
-        con.execute(text("DELETE FROM user_credentials WHERE account_id=:aid"), {"aid": account_id})
-
-def set_user_cookie(account_id: str):
-    exp = (datetime.now(timezone.utc) + timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
-    cookie.set("jira_user", account_id, expires=exp, key="set_jira_user")  # HttpOnly/SameSite werden lib-seitig gesetzt
-
-def get_user_cookie() -> Optional[str]:
-    cookies = cookie.get_all(key="read_all") or {}
-    return cookies.get("jira_user")
-
-def clear_user_cookie():
-    cookie.delete("jira_user", key="del_jira_user")
+def storage_del_user():
+    try:
+        if STORAGE_MODE == "cookie":
+            cookie.delete("jira_user", key="del_jira_user")
+        elif STORAGE_MODE == "localstorage":
+            local_remove("jira_user")
+    except Exception:
+        pass
 
 # ----------------------------- Helpers -----------------------------
 P_PATTERN = re.compile(r"^P\d{6}$")
@@ -183,26 +172,30 @@ class JiraClientBasic:
         return dict(r.headers), r.status_code
 
 # ----------------------------- App Header -----------------------------
-st.title("Jira Stichwort-Zuordnung — PRO v4.1 (Cloud)")
-st.caption("Per-User-Login (Cookie+DB) • Timesheet • Health-Check+ • Multi-Tab • Multi-Projekt")
+st.title("Jira Stichwort-Zuordnung — PRO v4.2 (Cloud)")
+st.caption("Per-User-Login (Cookie/LocalStorage + DB) • Timesheet • Health-Check+ • Multi-Tab • Multi-Projekt")
+if STORAGE_MODE == "localstorage":
+    st.info("Hinweis: Fallback auf Browser LocalStorage aktiv (Cookie-Komponente nicht verfügbar).")
 
 for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev"]: 
     st.session_state.setdefault(k, None)
 
-# ----------------------------- Auto-Connect via Cookie (nach Warmup) -----------------------------
+# ----------------------------- Auto-Connect via client storage ------------------
 if not st.session_state.get("jira"):
-    aid = get_user_cookie()
+    aid = storage_get_user()
     if aid:
-        creds = load_creds(aid)
-        if creds:
-            try:
-                jira = JiraClientBasic(creds["base_url"], creds["email"], creds["api_token"])
-                me = jira.get_myself()
-                st.session_state.jira=jira; st.session_state.myself=me; st.session_state.site_url=creds["base_url"]
+        try:
+            # DB ops
+            with engine.begin() as con:
+                row = con.execute(text("SELECT jira_base_url, email, enc_token FROM user_credentials WHERE account_id=:aid"), {"aid": aid}).fetchone()
+            if row:
+                base_url, email, enc_enc = row[0], row[1], row[2]
+                api_token = cipher.decrypt(base64.b64decode(enc_enc.encode())).decode()
+                jira = JiraClientBasic(base_url, email, api_token); me = jira.get_myself()
+                st.session_state.jira, st.session_state.myself, st.session_state.site_url = jira, me, base_url
                 st.session_state.sidebar_collapsed=True
-            except Exception as e:
-                st.sidebar.warning("Auto-Login fehlgeschlagen – bitte neu anmelden.")
-# ------------------------------------------------------------------------------------------------
+        except Exception as e:
+            st.sidebar.warning(f"Auto-Login fehlgeschlagen: {e}")
 
 # ----------------------------- Login Sidebar -----------------------------
 st.sidebar.header("Anmeldung (pro Benutzer)")
@@ -220,17 +213,21 @@ forget_device = colA.button("Dieses Gerät vergessen")
 delete_saved  = colB.button("Gespeicherte Daten löschen")
 
 if forget_device:
-    clear_user_cookie()
-    st.sidebar.success("Geräte-Cookie gelöscht.")
+    storage_del_user()
+    st.sidebar.success("Geräte-Speicherung gelöscht.")
 
 if delete_saved:
     try:
         if st.session_state.get("myself"):
-            delete_creds(st.session_state["myself"]["accountId"])
+            with engine.begin() as con:
+                con.execute(text("DELETE FROM user_credentials WHERE account_id=:aid"), {"aid": st.session_state["myself"]["accountId"]})
             st.sidebar.success("Gespeicherte Zugangsdaten gelöscht.")
         else:
-            aid = get_user_cookie()
-            if aid: delete_creds(aid); st.sidebar.success("Gespeicherte Zugangsdaten gelöscht.")
+            aid = storage_get_user()
+            if aid:
+                with engine.begin() as con:
+                    con.execute(text("DELETE FROM user_credentials WHERE account_id=:aid"), {"aid": aid})
+                st.sidebar.success("Gespeicherte Zugangsdaten gelöscht.")
     except Exception as e:
         st.sidebar.error(f"Konnte nicht löschen: {e}")
 
@@ -240,14 +237,25 @@ if connect:
         st.session_state.jira=jira; st.session_state.myself=me; st.session_state.site_url=base_url
         st.session_state.sidebar_collapsed=True
         if remember:
-            save_creds(me["accountId"], base_url, email, api_token)
-            set_user_cookie(me["accountId"])
+            # save creds
+            enc = base64.b64encode(cipher.encrypt(api_token.encode())).decode()
+            with engine.begin() as con:
+                con.execute(text("""
+                    INSERT INTO user_credentials (account_id, jira_base_url, email, enc_token, updated_at)
+                    VALUES (:aid,:url,:mail,:tok, CURRENT_TIMESTAMP)
+                    ON CONFLICT (account_id) DO UPDATE SET
+                      jira_base_url=EXCLUDED.jira_base_url,
+                      email=EXCLUDED.email,
+                      enc_token=EXCLUDED.enc_token,
+                      updated_at=CURRENT_TIMESTAMP
+                """), {"aid": me["accountId"], "url": base_url, "mail": email, "tok": enc})
+            storage_set_user(me["accountId"])
         st.success(f"Verbunden als: {me.get('displayName')}")
     except Exception as e:
         st.sidebar.error(f"Verbindungsfehler: {e}")
 
 if logout:
-    clear_user_cookie()
+    storage_del_user()
     for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
         st.session_state[k]=None
     st.rerun()
@@ -554,8 +562,7 @@ with tab_timesheet:
     if colts3.button("Nächste Woche ›", key="ts_next"): st.session_state.ts_date=wk_date + timedelta(days=7); st.rerun()
     mine_only=colts4.toggle("Nur eigene Worklogs", value=True, key="ts_mine")
 
-    week_start,_=week_bounds_from(wk_date); days=[week_start+timedelta(days=7*i//7) for i in range(7)]  # safer construction
-    days=[week_start+timedelta(days=i) for i in range(7)]
+    week_start,_=week_bounds_from(wk_date); days=[week_start+timedelta(days=i) for i in range(7)]
     day_cols=[d.strftime("%a\n%d.%m") for d in days]; st.caption(f"Kalenderwoche: {week_start.isoformat()} bis {(week_start+timedelta(days=6)).isoformat()}")
 
     if st.button("Zeiten laden", key="ts_load"):

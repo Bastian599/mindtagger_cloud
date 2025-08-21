@@ -4,5 +4,8 @@ pandas==2.2.2
 openpyxl==3.1.5
 SQLAlchemy==2.0.31
 cryptography==42.0.8
-extra-streamlit-components==0.1.60
 psycopg2-binary==2.9.9
+# Fallback client storage via browser localStorage
+streamlit-js-eval==0.1.7
+# CookieManager (optional; falls verfügbar)
+extra-streamlit-components==0.1.60
