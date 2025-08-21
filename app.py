@@ -1,10 +1,10 @@
-# app.py — Jira Stichwort-Zuordnung PRO v4.2 (Cloud)
-# New in 4.2:
-# - Robust client storage: try extra_streamlit_components.CookieManager,
-#   fall back to browser localStorage via streamlit_js_eval if the component cannot load.
-# - Unique keys for all cookie ops; warmup + rerun only when CookieManager is active.
+# app.py — Jira Stichwort-Zuordnung PRO v5 (E-Mail + PIN, ohne Cookies)
+# - Login-Flow: E-Mail + PIN (kein Cookie/LocalStorage)
+# - Erstkonfiguration/Token-Änderung: E-Mail + Jira-URL + API-Token + PIN setzen/ändern
+# - Tokens werden mit einem aus der PIN abgeleiteten Schlüssel (scrypt) via Fernet verschlüsselt
+# - Features: Übersicht, P-Labels (Dry-Run), Worklog (Einzeln), CSV-Import, Reports, Timesheet, Health-Check+
 
-import os, re, io, time, json, base64
+import os, re, io, time, json, base64, hashlib
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, date, time as dtime, timedelta, timezone
 
@@ -14,9 +14,9 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from cryptography.fernet import Fernet
 
-st.set_page_config(page_title="Jira Stichwort-Zuordnung PRO v4.2 — Cloud", layout="wide")
+st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v5 (PIN-Login)", layout="wide")
 
-# ----------------------------- Secrets & Defaults -----------------------------
+# ----------------------------- Secrets & DB -----------------------------
 def _sec(name: str, default: str = "") -> str:
     try: return st.secrets.get(name, default)  # type: ignore[attr-defined]
     except Exception: return os.getenv(name, default)
@@ -28,73 +28,70 @@ if not FERNET_KEY:
     st.stop()
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
-cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
+global_cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
 
-# ----------------------------- Client storage (Cookie or LocalStorage) --------
-STORAGE_MODE = None  # "cookie" | "localstorage" | None
-cookie = None
-local_get = local_set = local_remove = None
-
-try:
-    import extra_streamlit_components as stx  # type: ignore
-    cookie = stx.CookieManager(key="cookie_mgr_v2")
-    STORAGE_MODE = "cookie"
-except Exception:
-    try:
-        from streamlit_js_eval import get_local_storage, set_local_storage, remove_local_storage  # type: ignore
-        local_get, local_set, local_remove = get_local_storage, set_local_storage, remove_local_storage
-        STORAGE_MODE = "localstorage"
-    except Exception:
-        STORAGE_MODE = None
-
-# Warmup for CookieManager only
-if STORAGE_MODE == "cookie" and "cookies_warmed" not in st.session_state:
-    try:
-        cookie.get_all(key="warmup_all")
-    except Exception:
-        pass
-    st.session_state["cookies_warmed"] = True
-    st.rerun()
-
-def storage_get_user() -> Optional[str]:
-    try:
-        if STORAGE_MODE == "cookie":
-            cookies = cookie.get_all(key="read_all") or {}
-            return cookies.get("jira_user")
-        elif STORAGE_MODE == "localstorage":
-            return local_get("jira_user")
-    except Exception:
-        return None
-    return None
-
-def storage_set_user(account_id: str):
-    try:
-        if STORAGE_MODE == "cookie":
-            exp = (datetime.now(timezone.utc) + timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
-            cookie.set("jira_user", account_id, expires=exp, key="set_jira_user")
-        elif STORAGE_MODE == "localstorage":
-            local_set("jira_user", account_id)
-    except Exception:
-        pass
-
-def storage_del_user():
-    try:
-        if STORAGE_MODE == "cookie":
-            cookie.delete("jira_user", key="del_jira_user")
-        elif STORAGE_MODE == "localstorage":
-            local_remove("jira_user")
-    except Exception:
-        pass
+def db_init():
+    with engine.begin() as con:
+        # PIN-basierte Tabelle
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS user_pin (
+          email TEXT PRIMARY KEY,
+          salt  BYTEA NOT NULL,
+          enc_token TEXT NOT NULL,
+          jira_base_url TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """))
+db_init()
 
 # ----------------------------- Helpers -----------------------------
+def kdf_from_pin(pin: str, salt: bytes) -> bytes:
+    # 32-Byte-Schlüssel aus PIN ableiten (scrypt)
+    return hashlib.scrypt(pin.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+
+def fernet_from_pin(pin: str, salt: bytes) -> Fernet:
+    key = base64.urlsafe_b64encode(kdf_from_pin(pin, salt))
+    return Fernet(key)
+
+def set_pin_credentials(email: str, base_url: str, api_token: str, account_id: str, pin: str):
+    salt = os.urandom(16)
+    f = fernet_from_pin(pin, salt)
+    enc_token = f.encrypt(api_token.encode()).decode()
+    with engine.begin() as con:
+        con.execute(text("""
+        INSERT INTO user_pin (email, salt, enc_token, jira_base_url, account_id, updated_at)
+        VALUES (:email, :salt, :enc, :url, :acc, CURRENT_TIMESTAMP)
+        ON CONFLICT (email) DO UPDATE SET
+          salt = EXCLUDED.salt,
+          enc_token = EXCLUDED.enc_token,
+          jira_base_url = EXCLUDED.jira_base_url,
+          account_id = EXCLUDED.account_id,
+          updated_at = CURRENT_TIMESTAMP
+        """), {"email": email, "salt": salt, "enc": enc_token, "url": base_url, "acc": account_id})
+
+def load_pin_row(email: str):
+    with engine.begin() as con:
+        row = con.execute(text("""
+        SELECT salt, enc_token, jira_base_url, account_id FROM user_pin WHERE email=:email
+        """), {"email": email}).fetchone()
+    return row
+
+def delete_pin_row(email: str):
+    with engine.begin() as con:
+        con.execute(text("DELETE FROM user_pin WHERE email=:email"), {"email": email})
+
+def normalize_base_url(url: str) -> str:
+    url=(url or "").strip()
+    return url[:-1] if url.endswith("/") else url
+
+# Jira helpers
 P_PATTERN = re.compile(r"^P\d{6}$")
 def is_p_label(label: str) -> bool: return bool(P_PATTERN.match(label or ""))
 def extract_p_label(labels: List[str]) -> Optional[str]:
     for l in labels or []:
         if is_p_label(l): return l
     return None
-def hide_sidebar_css():
-    st.markdown("""<style>[data-testid="stSidebar"]{display:none!important}.block-container{padding-top:1rem}</style>""", unsafe_allow_html=True)
 def to_started_iso(d: date, t: dtime) -> str:
     local_tz = datetime.now().astimezone().tzinfo
     return datetime.combine(d, t).replace(tzinfo=local_tz).strftime("%Y-%m-%dT%H:%M:%S.000%z")
@@ -109,9 +106,8 @@ def week_bounds_from(d: date) -> Tuple[date,date]:
     monday = d - timedelta(days=d.weekday())
     return monday, monday+timedelta(days=7)
 
-# ----------------------------- Jira Client (Basic) ------------------------
+# ----------------------------- Jira Client -----------------------------
 class JiraError(Exception): pass
-def normalize_base_url(url: str) -> str: url=(url or "").strip(); return url[:-1] if url.endswith("/") else url
 
 class JiraClientBasic:
     def __init__(self, base_url, email, api_token, timeout=30):
@@ -171,101 +167,77 @@ class JiraClientBasic:
         r=self._req("GET","/rest/api/3/myself", return_headers=True)
         return dict(r.headers), r.status_code
 
-# ----------------------------- App Header -----------------------------
-st.title("Jira Stichwort-Zuordnung — PRO v4.2 (Cloud)")
-st.caption("Per-User-Login (Cookie/LocalStorage + DB) • Timesheet • Health-Check+ • Multi-Tab • Multi-Projekt")
-if STORAGE_MODE == "localstorage":
-    st.info("Hinweis: Fallback auf Browser LocalStorage aktiv (Cookie-Komponente nicht verfügbar).")
+# ----------------------------- UI State -----------------------------
+st.title("Jira Stichwort-Zuordnung — PRO v5 (PIN-Login)")
+st.caption("E-Mail+PIN • keine Cookies • Timesheet • Health-Check+ • Multi-Projekt")
 
 for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev"]: 
     st.session_state.setdefault(k, None)
 
-# ----------------------------- Auto-Connect via client storage ------------------
-if not st.session_state.get("jira"):
-    aid = storage_get_user()
-    if aid:
-        try:
-            # DB ops
-            with engine.begin() as con:
-                row = con.execute(text("SELECT jira_base_url, email, enc_token FROM user_credentials WHERE account_id=:aid"), {"aid": aid}).fetchone()
-            if row:
-                base_url, email, enc_enc = row[0], row[1], row[2]
-                api_token = cipher.decrypt(base64.b64decode(enc_enc.encode())).decode()
+# ----------------------------- Login & Setup -----------------------------
+login_mode = st.sidebar.radio("Login-Variante", ["Schnell-Login (E-Mail + PIN)", "Erstkonfiguration / Token ändern"], index=0)
+
+if login_mode == "Schnell-Login (E-Mail + PIN)":
+    st.sidebar.subheader("Schnell-Login")
+    email = st.sidebar.text_input("E-Mail", value="", key="pin_email")
+    pin   = st.sidebar.text_input("PIN (6+ Zeichen empfohlen)", type="password", key="pin_login")
+    colL, colR = st.sidebar.columns(2)
+    do_login = colL.button("Verbinden", key="btn_login")
+    do_logout = colR.button("Logout", key="btn_logout")
+    if do_login:
+        row = load_pin_row(email)
+        if not row:
+            st.sidebar.error("Kein Datensatz für diese E-Mail. Bitte zuerst unter 'Erstkonfiguration' einrichten.")
+        else:
+            salt, enc_token, base_url, account_id = row
+            try:
+                f = fernet_from_pin(pin, salt)
+                api_token = f.decrypt(enc_token.encode()).decode()
                 jira = JiraClientBasic(base_url, email, api_token); me = jira.get_myself()
                 st.session_state.jira, st.session_state.myself, st.session_state.site_url = jira, me, base_url
                 st.session_state.sidebar_collapsed=True
-        except Exception as e:
-            st.sidebar.warning(f"Auto-Login fehlgeschlagen: {e}")
+                st.sidebar.success(f"Verbunden als: {me.get('displayName')}")
+            except Exception as e:
+                st.sidebar.error(f"PIN oder Daten ungültig: {e}")
+    if do_logout:
+        for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
+            st.session_state[k]=None
+        st.sidebar.success("Abgemeldet.")
+        st.rerun()
 
-# ----------------------------- Login Sidebar -----------------------------
-st.sidebar.header("Anmeldung (pro Benutzer)")
-base_url  = st.sidebar.text_input("Jira Base-URL", value="")
-email     = st.sidebar.text_input("E-Mail", value="")
-api_token = st.sidebar.text_input("API Token", type="password", value="")
-remember  = st.sidebar.checkbox("Auf diesem Gerät merken", value=True)
-colL, colR = st.sidebar.columns(2)
-connect = colL.button("Verbinden")
-logout  = colR.button("Logout")
-
-# Device/Credential controls
-colA, colB = st.sidebar.columns(2)
-forget_device = colA.button("Dieses Gerät vergessen")
-delete_saved  = colB.button("Gespeicherte Daten löschen")
-
-if forget_device:
-    storage_del_user()
-    st.sidebar.success("Geräte-Speicherung gelöscht.")
-
-if delete_saved:
-    try:
-        if st.session_state.get("myself"):
-            with engine.begin() as con:
-                con.execute(text("DELETE FROM user_credentials WHERE account_id=:aid"), {"aid": st.session_state["myself"]["accountId"]})
-            st.sidebar.success("Gespeicherte Zugangsdaten gelöscht.")
+else:
+    st.sidebar.subheader("Erstkonfiguration / Token ändern")
+    email    = st.sidebar.text_input("E-Mail", value="", key="setup_email")
+    base_url = st.sidebar.text_input("Jira Base-URL", value="", key="setup_url")
+    api_tok  = st.sidebar.text_input("API Token", type="password", key="setup_token")
+    pin1     = st.sidebar.text_input("PIN neu", type="password", key="setup_pin1")
+    pin2     = st.sidebar.text_input("PIN bestätigen", type="password", key="setup_pin2")
+    do_save  = st.sidebar.button("Speichern / Aktualisieren", key="btn_save")
+    do_delete= st.sidebar.button("Datensatz löschen", key="btn_del")
+    if do_save:
+        if pin1 != pin2 or not pin1:
+            st.sidebar.error("PINs stimmen nicht überein oder leer.")
         else:
-            aid = storage_get_user()
-            if aid:
-                with engine.begin() as con:
-                    con.execute(text("DELETE FROM user_credentials WHERE account_id=:aid"), {"aid": aid})
-                st.sidebar.success("Gespeicherte Zugangsdaten gelöscht.")
-    except Exception as e:
-        st.sidebar.error(f"Konnte nicht löschen: {e}")
+            try:
+                # Testverbindung (optional, aber hilfreich)
+                test = JiraClientBasic(base_url, email, api_tok).get_myself()
+                account_id = test.get("accountId","")
+                set_pin_credentials(email, base_url, api_tok, account_id, pin1)
+                st.sidebar.success("Gespeichert. Du kannst nun mit E-Mail+PIN einloggen.")
+            except Exception as e:
+                st.sidebar.error(f"Konnte nicht speichern: {e}")
+    if do_delete:
+        try:
+            delete_pin_row(st.session_state.get("setup_email",""))
+            st.sidebar.success("Datensatz gelöscht.")
+        except Exception as e:
+            st.sidebar.error(f"Konnte nicht löschen: {e}")
 
-if connect:
-    try:
-        jira = JiraClientBasic(base_url, email, api_token); me = jira.get_myself()
-        st.session_state.jira=jira; st.session_state.myself=me; st.session_state.site_url=base_url
-        st.session_state.sidebar_collapsed=True
-        if remember:
-            # save creds
-            enc = base64.b64encode(cipher.encrypt(api_token.encode())).decode()
-            with engine.begin() as con:
-                con.execute(text("""
-                    INSERT INTO user_credentials (account_id, jira_base_url, email, enc_token, updated_at)
-                    VALUES (:aid,:url,:mail,:tok, CURRENT_TIMESTAMP)
-                    ON CONFLICT (account_id) DO UPDATE SET
-                      jira_base_url=EXCLUDED.jira_base_url,
-                      email=EXCLUDED.email,
-                      enc_token=EXCLUDED.enc_token,
-                      updated_at=CURRENT_TIMESTAMP
-                """), {"aid": me["accountId"], "url": base_url, "mail": email, "tok": enc})
-            storage_set_user(me["accountId"])
-        st.success(f"Verbunden als: {me.get('displayName')}")
-    except Exception as e:
-        st.sidebar.error(f"Verbindungsfehler: {e}")
-
-if logout:
-    storage_del_user()
-    for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
-        st.session_state[k]=None
-    st.rerun()
-
-# --- Erst hier stoppen, falls nicht verbunden ---
+# --- Stop, wenn keine Verbindung vorhanden ---
 if not st.session_state.get("jira"):
     st.stop()
-# ------------------------------------------------
 
-# Sidebar collapse
+# Sidebar einklappen
 def hide_sidebar_css():
     st.markdown("""<style>[data-testid="stSidebar"]{display:none!important}.block-container{padding-top:1rem}</style>""", unsafe_allow_html=True)
 if st.session_state.get("sidebar_collapsed", False):
@@ -276,7 +248,7 @@ else:
 
 jira=st.session_state.jira; me=st.session_state.myself; site_url=st.session_state.site_url
 
-# ----------------------------- Projekte ----------------------------
+# ----------------------------- Projekte & Daten -----------------------------
 def _invalidate_projects():
     st.session_state.projects_cache=None
 
@@ -307,7 +279,6 @@ else:
 
 st.markdown("—")
 
-# ----------------------------- Daten laden -------------------------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.DataFrame:
     if isinstance(project_keys, str): project_keys=[project_keys]
@@ -553,6 +524,10 @@ with tab_reports:
         st.download_button("CSV herunterladen", data=df.to_csv(index=False).encode("utf-8"), file_name="tickets_uebersicht.csv", mime="text/csv", key="rep_csv")
 
 # ----------------------------- Timesheet --------------------------
+def week_bounds_from(d: date) -> Tuple[date,date]:
+    monday = d - timedelta(days=d.weekday())
+    return monday, monday + timedelta(days=7)
+
 with tab_timesheet:
     st.subheader("Wochenansicht / Timesheet")
     today=datetime.now().date()
