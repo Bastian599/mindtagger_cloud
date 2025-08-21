@@ -137,6 +137,23 @@ class JiraClientBasic:
         d = self._req("GET", "/rest/api/3/status") or []
         return {s.get("name") for s in d if s.get("name")}
 
+    def list_status_names_for_projects(self, project_keys):
+        names=set()
+        for k in project_keys:
+            try:
+                d=self._req("GET", f"/rest/api/3/project/{k}/statuses") or []
+                for st in d:
+                    for s in st.get("statuses", []):
+                        n=s.get("name");
+                        if n: names.add(n)
+            except Exception:
+                pass
+        return names
+
+    def list_status_names(self):
+        d = self._req("GET", "/rest/api/3/status") or []
+        return {s.get("name") for s in d if s.get("name")}
+
 class JiraClientOAuth:
     AUTH_BASE = "https://auth.atlassian.com"
     API_BASE  = "https://api.atlassian.com"
@@ -214,6 +231,23 @@ class JiraClientOAuth:
         self._req("DELETE", f"/rest/api/3/issue/{issue_key}/worklog/{worklog_id}")
     def my_permissions(self):
         return self._req("GET", "/rest/api/3/mypermissions", params={"projectKey": ""})
+
+    def list_status_names(self):
+        d = self._req("GET", "/rest/api/3/status") or []
+        return {s.get("name") for s in d if s.get("name")}
+
+    def list_status_names_for_projects(self, project_keys):
+        names=set()
+        for k in project_keys:
+            try:
+                d=self._req("GET", f"/rest/api/3/project/{k}/statuses") or []
+                for st in d:
+                    for s in st.get("statuses", []):
+                        n=s.get("name");
+                        if n: names.add(n)
+            except Exception:
+                pass
+        return names
 
     def list_status_names(self):
         d = self._req("GET", "/rest/api/3/status") or []
@@ -517,7 +551,22 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
     if not project_keys: 
         return pd.DataFrame(columns=["Project","Key","Ticket","Summary","Status","P_Label_Aktuell","Alle_Labels"])
     quoted = ",".join([f'"{k}"' for k in project_keys])
-    jql = f'project in ({quoted}) AND status not in ("Closed","Geschlossen","Abgebrochen") ORDER BY created DESC'
+    # v6.3j: Exklusion pro Projekt (Team‑/Company‑managed) + Resolution "Abgebrochen"
+    desired = ["Closed","Geschlossen","Abgebrochen"]
+    try:
+        names = _jira_client.list_status_names_for_projects(project_keys)
+        if not names:
+            names = _jira_client.list_status_names()
+    except Exception:
+        names = set()
+    excludes = [s for s in desired if s in names]
+    base_clause = f'project in ({quoted})'
+    res_clause = '(resolution is EMPTY OR resolution not in ("Abgebrochen"))'
+    if excludes:
+        not_in = ",".join([f'"{s}"' for s in excludes])
+        jql = f'{base_clause} AND status not in ({not_in}) AND {res_clause} ORDER BY created DESC'
+    else:
+        jql = f'{base_clause} AND {res_clause} ORDER BY created DESC'
     fields = ["summary","status","labels","project"]
     issues = _jira_client.search_issues(jql, fields)
     rows=[]
