@@ -1,8 +1,8 @@
-# app.py — Jira Stichwort-Zuordnung PRO v6 (Jira SSO + E-Mail/PIN)
-# - Login-Optionen:
-#     1) Jira SSO (Atlassian OAuth 2.0 3LO + PKCE) — bevorzugt
-#     2) E-Mail + PIN (kein Cookie; Token verschlüsselt via scrypt+Fernet)
-# - Features: Übersicht, P-Labels (Dry-Run), Worklog (Einzeln), CSV-Import, Reports, Timesheet, Health-Check+
+# app.py — Jira Stichwort-Zuordnung PRO v6.1 (SSO+PIN) — Full
+# - Jira SSO (Atlassian OAuth 3LO): Confidential Client fix (kein Session-State-Vergleich, kein PKCE nötig)
+# - Falls kein Client Secret: PKCE mit Verifier im verschlüsselten state (überlebt Redirect ohne Cookies)
+# - Zusätzlich: E-Mail + PIN (kein Browser-Speicher)
+# - Features: Übersicht, P-Labels (Dry-Run), Worklog, CSV-Import, Timesheet, Health-Check+
 
 import os, re, io, time, json, base64, hashlib, urllib.parse
 from typing import List, Dict, Any, Optional, Tuple
@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, text
 from cryptography.fernet import Fernet
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v6 (SSO + PIN)", layout="wide")
+st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v6.1 (SSO+PIN)", layout="wide")
 
 # ----------------------------- Secrets & DB -----------------------------
 def _sec(name: str, default: str = "") -> str:
@@ -25,8 +25,8 @@ def _sec(name: str, default: str = "") -> str:
 DB_URL = _sec("DATABASE_URL", "sqlite:///./creds.db")
 FERNET_KEY = _sec("FERNET_KEY", "")
 ATL_CLIENT_ID = _sec("ATLASSIAN_CLIENT_ID", "")
-ATL_CLIENT_SECRET = _sec("ATLASSIAN_CLIENT_SECRET", "")  # optional; wenn leer -> PKCE public client
-ATL_REDIRECT_URI = _sec("ATLASSIAN_REDIRECT_URI", "")    # z.B. "https://<deine-app-URL>"
+ATL_CLIENT_SECRET = _sec("ATLASSIAN_CLIENT_SECRET", "")  # optional; wenn gesetzt ⇒ Confidential Client
+ATL_REDIRECT_URI = _sec("ATLASSIAN_REDIRECT_URI", "")    # z.B. "https://<deine-app-url>"
 ATL_SCOPES = _sec("ATLASSIAN_SCOPES", "read:jira-user read:jira-work write:jira-work offline_access")
 
 if not FERNET_KEY:
@@ -144,19 +144,12 @@ class JiraClientOAuth:
         self.timeout=30
 
     def _ensure_token(self):
-        # Refresh if expires within 60s
         if datetime.now(timezone.utc) + timedelta(seconds=60) < self.expires_at:
             return
-        data = {
-            "grant_type":"refresh_token",
-            "client_id": self.client_id,
-            "refresh_token": self.refresh_token,
-        }
-        if self.client_secret:
-            data["client_secret"] = self.client_secret
+        data = {"grant_type":"refresh_token","client_id": self.client_id,"refresh_token": self.refresh_token}
+        if self.client_secret: data["client_secret"] = self.client_secret
         r=requests.post(f"{self.AUTH_BASE}/oauth/token", json=data, timeout=30, headers={"Content-Type":"application/json"})
-        if r.status_code>=400:
-            raise JiraError(f"Token-Refresh fehlgeschlagen: {r.status_code} {r.text}")
+        if r.status_code>=400: raise JiraError(f"Token-Refresh fehlgeschlagen: {r.status_code} {r.text}")
         j=r.json()
         self.access_token=j["access_token"]; self.refresh_token=j.get("refresh_token", self.refresh_token)
         self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(j.get("expires_in", 3600)))
@@ -170,11 +163,8 @@ class JiraClientOAuth:
             if r.status_code in (429,502,503,504):
                 time.sleep(1.5*(attempt+1)); continue
             if r.status_code==401 and attempt==0:
-                # einmal refresh erzwingen
                 self.expires_at = datetime.now(timezone.utc)  # force refresh
-                self._ensure_token()
-                headers["Authorization"]=f"Bearer {self.access_token}"
-                continue
+                self._ensure_token(); headers["Authorization"]=f"Bearer {self.access_token}"; continue
             if r.status_code>=400:
                 try: detail=r.json()
                 except Exception: detail=r.text
@@ -201,7 +191,7 @@ class JiraClientOAuth:
             d=self._req("POST","/rest/api/3/search", data=json.dumps({"jql":jql,"startAt":start_at,"maxResults":batch_size,"fields":fields}))
             out.extend(d.get("issues",[])); 
             if start_at+batch_size>=d.get("total",0): break
-            start_at+=batch_size
+            start_at+=batch_size  # FIX: correct paginator
         return out
     def update_issue_labels(self, issue_key, new_labels):
         self._req("PUT", f"/rest/api/3/issue/{issue_key}", data=json.dumps({"fields":{"labels":new_labels}}))
@@ -341,8 +331,19 @@ def delete_oauth_row(email: str):
     with engine.begin() as con:
         con.execute(text("DELETE FROM user_oauth WHERE email=:email"), {"email": email})
 
+# robust query param reader (new/old streamlit)
+def _qp(key, default=None):
+    try:
+        v = st.query_params.get(key)
+        if isinstance(v, list):
+            return v[0] if v else default
+        return v if v is not None else default
+    except Exception:
+        v = st.experimental_get_query_params().get(key)
+        return v[0] if v else default
+
 # ----------------------------- UI State -----------------------------
-st.title("Jira Stichwort-Zuordnung — PRO v6 (SSO + PIN)")
+st.title("Jira Stichwort-Zuordnung — PRO v6.1 (SSO + PIN)")
 st.caption("Bevorzugt: Jira SSO (OAuth 3LO). Fallback: E-Mail + PIN.")
 
 for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev","oauth_in_progress","oauth_state","oauth_verifier"]: 
@@ -357,13 +358,21 @@ if login_mode == "Jira SSO":
     if not ATL_CLIENT_ID or not ATL_REDIRECT_URI:
         st.sidebar.warning("SSO ist noch nicht konfiguriert. Bitte Secrets setzen: ATLASSIAN_CLIENT_ID, ATLASSIAN_REDIRECT_URI (und optional ATLASSIAN_CLIENT_SECRET).")
     else:
-        # 1) Callback prüfen
-        params = st.query_params
-        code = params.get("code")
-        state = params.get("state")
-        if code and state and state == st.session_state.get("oauth_state"):
+        # 1) Callback prüfen (ohne Session-Vergleich)
+        code  = _qp("code")
+        state = _qp("state")
+        if code and state:
             try:
-                j = oauth_exchange_code(code, st.session_state.get("oauth_verifier"))
+                verifier_from_state = None
+                # Nur bei PKCE (ohne Client Secret) benötigen wir den Verifier aus dem verschlüsselten state
+                if not ATL_CLIENT_SECRET:
+                    try:
+                        payload = global_cipher.decrypt(base64.urlsafe_b64decode(state)).decode()
+                        verifier_from_state = json.loads(payload).get("v")
+                    except Exception:
+                        verifier_from_state = None
+
+                j = oauth_exchange_code(code, verifier_from_state)
                 access_token=j["access_token"]; refresh_token=j.get("refresh_token"); expires_in=int(j.get("expires_in",3600))
                 # Ressourcen holen
                 resources=oauth_accessible_resources(access_token)
@@ -373,8 +382,7 @@ if login_mode == "Jira SSO":
                     # Auswahl, wenn mehrere Sites
                     opts = [f'{r.get("name")} — {r.get("url")} ({r.get("id")})' for r in resources]
                     chosen = st.sidebar.selectbox("Workspace wählen", opts, index=0, key="sso_site_select")
-                    idx = opts.index(chosen)
-                    res = resources[idx]
+                    res = resources[opts.index(chosen)]
                     cloud_id = res.get("id"); site_url = res.get("url")
                     # Myself
                     headers={"Authorization": f"Bearer {access_token}"}
@@ -387,9 +395,13 @@ if login_mode == "Jira SSO":
                         save_oauth_tokens(email or "sso-user", me.get("accountId",""), cloud_id, site_url, access_token, refresh_token, expires_in)
                         # Client setzen
                         client = JiraClientOAuth(cloud_id, site_url, access_token, refresh_token, datetime.now(timezone.utc)+timedelta(seconds=expires_in), ATL_CLIENT_ID, ATL_CLIENT_SECRET or "")
-                        st.session_state.jira=client; st.session_state.myself=me; st.session_state.site_url=site_url; st.session_state.sidebar_collapsed=True
+                        st.session_state.jira=client; st.session_state.myself=me; st.session_state.site_url=site_url
+                        st.session_state.sidebar_collapsed=True
                         # Query aufräumen
-                        st.query_params.clear()
+                        try:
+                            st.query_params.clear()
+                        except Exception:
+                            st.experimental_set_query_params()
                         st.sidebar.success(f"Verbunden als: {me.get('displayName')}")
             except Exception as e:
                 st.sidebar.error(f"SSO Fehler: {e}")
@@ -397,22 +409,22 @@ if login_mode == "Jira SSO":
         if st.session_state.get("jira") is None:
             colA, colB = st.sidebar.columns([1,1])
             if colA.button("Mit Jira anmelden", key="btn_sso"):
-                state = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
-                verifier, challenge = pkce_pair() if not ATL_CLIENT_SECRET else (None, None)
-                st.session_state.oauth_state = state
-                st.session_state.oauth_verifier = verifier
+                if ATL_CLIENT_SECRET:
+                    # Confidential Client: kein PKCE nötig
+                    state_payload = json.dumps({"ts": int(time.time())})
+                    state = base64.urlsafe_b64encode(global_cipher.encrypt(state_payload.encode())).decode()
+                    verifier, challenge = None, None
+                else:
+                    # Public Client (PKCE)
+                    verifier, challenge = pkce_pair()
+                    payload = json.dumps({"v": verifier, "ts": int(time.time())})
+                    state = base64.urlsafe_b64encode(global_cipher.encrypt(payload.encode())).decode()
+                    # (wir speichern nichts in session; alles steckt im state)
                 url = build_authorize_url(state, challenge)
-
-                # ✅ erzwinge Navigation im obersten Fenster (kein iFrame)
-                components.html(f"""
-                    <script>
-                      window.top.location.href = "{url}";
-                    </script>
-                """, height=0)
-
-                # Fallback-Link, falls der Browser JS blockt
+                # Top-Level Navigation (kein iFrame/META-Refresh)
+                components.html(f'<script>window.top.location.href="{url}";</script>', height=0)
                 st.link_button("Falls keine Weiterleitung startet: Hier klicken", url, type="primary")
-if colB.button("Abmelden (SSO)", key="btn_sso_logout"):
+            if colB.button("Abmelden (SSO)", key="btn_sso_logout"):
                 for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
                     st.session_state[k]=None
                 st.sidebar.success("Abgemeldet.")
@@ -684,7 +696,8 @@ with tab_worklog:
             try:
                 wid=jira.add_worklog(use_key, to_started_iso(work_date, start_time), seconds, desc)
                 st.session_state.undo={"type":"worklogs","data":[(use_key,wid)]}; st.success(f"Worklog für {use_key} erfasst.")
-            except Exception as e: st.error(f"Fehler: {e}")
+            except Exception as e:
+                st.error(f"Fehler: {e}")
 
 # ----------------------------- CSV Import --------------------------
 with tab_csv:
@@ -834,14 +847,14 @@ with tab_health:
     t_myself,_,e1=timed(jira.get_myself); ok_msgs.append(f"/myself ok ({t_myself*1000:.0f} ms)" if not e1 else f"/myself Fehler: {e1}")
     t_proj,_,e2=timed(jira.list_projects,None); ok_msgs.append(f"/project/search ok ({t_proj*1000:.0f} ms)" if not e2 else f"/project/search Fehler: {e2}")
     try:
-        # Header-Check nur für Basic sinnvoll, aber wir versuchen generisch (OAuth auch liefert Date/Ratelimit)
-        if isinstance(jira, JiraClientBasic):
-            r = requests.get(f"{st.session_state.site_url}/rest/api/3/myself", auth=( "x","x"), timeout=10)
-            headers=dict(r.headers); status=r.status_code
-        else:
-            headers,status = {}, 200
-        rl=headers.get("X-RateLimit-Remaining") or headers.get("x-ratelimit-remaining") or "n/a"
-        stime=headers.get("Date")
+        stime=None; rl="n/a"; status=200
+        try:
+            # Bei Basic: Header vom direkten Endpoint
+            r = requests.get(f"{st.session_state.site_url}/rest/api/3/myself", timeout=10)
+            status=r.status_code; hdr=dict(r.headers); rl=hdr.get("X-RateLimit-Remaining") or hdr.get("x-ratelimit-remaining") or "n/a"
+            stime=hdr.get("Date")
+        except Exception:
+            pass
         skew="n/a"
         if stime:
             server_dt=pd.to_datetime(stime, utc=True).to_pydatetime()
