@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from cryptography.fernet import Fernet
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v6 (SSO + PIN)", layout="wide")
 
@@ -398,11 +399,20 @@ if login_mode == "Jira SSO":
             if colA.button("Mit Jira anmelden", key="btn_sso"):
                 state = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
                 verifier, challenge = pkce_pair() if not ATL_CLIENT_SECRET else (None, None)
-                st.session_state.oauth_state = state; st.session_state.oauth_verifier = verifier
+                st.session_state.oauth_state = state
+                st.session_state.oauth_verifier = verifier
                 url = build_authorize_url(state, challenge)
-                st.sidebar.write("Weiterleiten…")
-                st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
-            if colB.button("Abmelden (SSO)", key="btn_sso_logout"):
+
+                # ✅ erzwinge Navigation im obersten Fenster (kein iFrame)
+                components.html(f"""
+                    <script>
+                      window.top.location.href = "{url}";
+                    </script>
+                """, height=0)
+
+                # Fallback-Link, falls der Browser JS blockt
+                st.link_button("Falls keine Weiterleitung startet: Hier klicken", url, type="primary")
+if colB.button("Abmelden (SSO)", key="btn_sso_logout"):
                 for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
                     st.session_state[k]=None
                 st.sidebar.success("Abgemeldet.")
