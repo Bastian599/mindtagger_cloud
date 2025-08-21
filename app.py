@@ -383,7 +383,7 @@ def _qp(key, default=None):
             return v[0] if v else default
         return v if v is not None else default
     except Exception:
-        v = st.experimental_get_query_params().get(key)
+        v = dict(st.query_params).get(key)
         return v[0] if v else default
 
 # ----------------------------- UI State -----------------------------
@@ -583,7 +583,7 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
     return pd.DataFrame(rows)
 
 def refresh_after_update():
-    fetch_issues_df.clear(); st.experimental_set_query_params(_=str(time.time())); st.rerun()
+    fetch_issues_df.clear(); st.query_params['_'] = str(time.time()); st.rerun()
 
 df = fetch_issues_df(jira, selected_keys, site_url)
 
@@ -1072,7 +1072,7 @@ if st.session_state.get("undo"):
                 try: jira.update_issue_labels(k, old)
                 except Exception as e: errs.append(f"{k}: {e}")
             st.session_state.undo=None; st.success("Label-Änderung rückgängig gemacht."); 
-            fetch_issues_df.clear(); st.experimental_set_query_params(_=str(time.time())); st.rerun()
+            fetch_issues_df.clear(); st.query_params['_'] = str(time.time()); st.rerun()
     elif u["type"]=="worklogs":
         if st.button("↩️ Letzte Worklogs rückgängig machen", key="undo_wl"):
             errs=[]
