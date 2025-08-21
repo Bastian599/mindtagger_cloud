@@ -561,19 +561,23 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
         names = set()
     excludes = [s for s in desired if s in names]
     base_clause = f'project in ({quoted})'
-    res_clause = '(resolution is EMPTY OR resolution not in ("Abgebrochen"))'
     if excludes:
         not_in = ",".join([f'"{s}"' for s in excludes])
-        jql = f'{base_clause} AND status not in ({not_in}) AND {res_clause} ORDER BY created DESC'
+        jql = f'{base_clause} AND status not in ({not_in}) ORDER BY created DESC'
     else:
-        jql = f'{base_clause} AND {res_clause} ORDER BY created DESC'
-    fields = ["summary","status","labels","project"]
+        jql = f'{base_clause} ORDER BY created DESC'
+    fields = ["summary","status","labels","project","resolution"]
     issues = _jira_client.search_issues(jql, fields)
     rows=[]
     for it in issues:
         k=it.get("key"); f=it.get("fields",{})
         proj=(f.get("project") or {}).get("key","")
-        summary=f.get("summary",""); status=(f.get("status") or {}).get("name",""); labels=f.get("labels") or []
+        summary=f.get("summary","")
+        status=(f.get("status") or {}).get("name","")
+        resolution=(f.get("resolution") or {}).get("name","")
+        # Client-side safety filter
+        if status in {"Abgebrochen","Geschlossen","Closed"}: continue
+                labels=f.get("labels") or []
         p_label=extract_p_label(labels); link=f"{site_url}/browse/{k}" if site_url else ""
         rows.append({"Project":proj,"Key":k,"Ticket":link,"Summary":summary,"Status":status,"P_Label_Aktuell":p_label or "", "Alle_Labels":", ".join(labels) if labels else ""})
     return pd.DataFrame(rows)
