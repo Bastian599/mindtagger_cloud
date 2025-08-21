@@ -886,7 +886,7 @@ with tab_reports:
         logs=[]; errs=[]; prog=st.progress(0.0, text="Lade eigene Worklogs…")
         for i,it in enumerate(issues, start=1):
             k=it.get("key"); f=it.get("fields",{})
-        labels = f.get("labels") or []; p_val=extract_p_label(labels) or "(kein P)"
+            labels = f.get("labels") or []; p_val=extract_p_label(labels) or "(kein P)"
             try:
                 wl=jira.list_worklogs(k) or {}
                 for w in wl.get("worklogs", []):
