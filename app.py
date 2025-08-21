@@ -509,7 +509,7 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
     if not project_keys: 
         return pd.DataFrame(columns=["Project","Key","Ticket","Summary","Status","P_Label_Aktuell","Alle_Labels"])
     quoted = ",".join([f'"{k}"' for k in project_keys])
-    jql = f'project in ({quoted}) ORDER BY created DESC'
+    jql = f'project in ({quoted}) AND status not in ("Closed","Geschlossen") ORDER BY created DESC'
     fields = ["summary","status","labels","project"]
     issues = _jira_client.search_issues(jql, fields)
     rows=[]
