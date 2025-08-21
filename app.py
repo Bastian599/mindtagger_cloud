@@ -36,7 +36,7 @@ cookie = stx.CookieManager(key="cookie_mgr_v1")
 
 # --- Cookie-Warmup: Erstes Render initialisiert Cookies, dann sofort rerun ---
 if "cookies_warmed" not in st.session_state:
-    cookie.get_all()  # Frontend initialisiert Cookie-Bridge
+    cookie.get_all(key="warmup_all")  # Frontend initialisiert Cookie-Bridge
     st.session_state["cookies_warmed"] = True
     st.rerun()
 # -----------------------------------------------------------------------------
@@ -88,14 +88,14 @@ def delete_creds(account_id: str):
 
 def set_user_cookie(account_id: str):
     exp = (datetime.now(timezone.utc) + timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
-    cookie.set("jira_user", account_id, expires=exp)  # HttpOnly/SameSite werden lib-seitig gesetzt
+    cookie.set("jira_user", account_id, expires=exp, key="set_jira_user")  # HttpOnly/SameSite werden lib-seitig gesetzt
 
 def get_user_cookie() -> Optional[str]:
-    cookies = cookie.get_all() or {}
+    cookies = cookie.get_all(key="read_all") or {}
     return cookies.get("jira_user")
 
 def clear_user_cookie():
-    cookie.delete("jira_user")
+    cookie.delete("jira_user", key="del_jira_user")
 
 # ----------------------------- Helpers -----------------------------
 P_PATTERN = re.compile(r"^P\d{6}$")
