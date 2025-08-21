@@ -38,7 +38,7 @@ cookie = stx.CookieManager(key="cookie_mgr_v1")
 if "cookies_warmed" not in st.session_state:
     cookie.get_all()  # Frontend initialisiert Cookie-Bridge
     st.session_state["cookies_warmed"] = True
-    st.experimental_rerun()
+    st.rerun()
 # -----------------------------------------------------------------------------
 
 def enc_to_str(s: str) -> str:
