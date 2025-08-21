@@ -1,10 +1,10 @@
-# app.py — Jira Stichwort-Zuordnung PRO v5 (E-Mail + PIN, ohne Cookies)
-# - Login-Flow: E-Mail + PIN (kein Cookie/LocalStorage)
-# - Erstkonfiguration/Token-Änderung: E-Mail + Jira-URL + API-Token + PIN setzen/ändern
-# - Tokens werden mit einem aus der PIN abgeleiteten Schlüssel (scrypt) via Fernet verschlüsselt
+# app.py — Jira Stichwort-Zuordnung PRO v6 (Jira SSO + E-Mail/PIN)
+# - Login-Optionen:
+#     1) Jira SSO (Atlassian OAuth 2.0 3LO + PKCE) — bevorzugt
+#     2) E-Mail + PIN (kein Cookie; Token verschlüsselt via scrypt+Fernet)
 # - Features: Übersicht, P-Labels (Dry-Run), Worklog (Einzeln), CSV-Import, Reports, Timesheet, Health-Check+
 
-import os, re, io, time, json, base64, hashlib
+import os, re, io, time, json, base64, hashlib, urllib.parse
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, date, time as dtime, timedelta, timezone
 
@@ -14,7 +14,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from cryptography.fernet import Fernet
 
-st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v5 (PIN-Login)", layout="wide")
+st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v6 (SSO + PIN)", layout="wide")
 
 # ----------------------------- Secrets & DB -----------------------------
 def _sec(name: str, default: str = "") -> str:
@@ -23,16 +23,30 @@ def _sec(name: str, default: str = "") -> str:
 
 DB_URL = _sec("DATABASE_URL", "sqlite:///./creds.db")
 FERNET_KEY = _sec("FERNET_KEY", "")
+ATL_CLIENT_ID = _sec("ATLASSIAN_CLIENT_ID", "")
+ATL_CLIENT_SECRET = _sec("ATLASSIAN_CLIENT_SECRET", "")  # optional; wenn leer -> PKCE public client
+ATL_REDIRECT_URI = _sec("ATLASSIAN_REDIRECT_URI", "")    # z.B. "https://<deine-app-URL>"
+ATL_SCOPES = _sec("ATLASSIAN_SCOPES", "read:jira-user read:jira-work write:jira-work offline_access")
+
 if not FERNET_KEY:
-    st.error("Admin-Hinweis: FERNET_KEY fehlt in Secrets. Bitte in Streamlit Secrets setzen.")
+    st.error("Admin-Hinweis: FERNET_KEY fehlt in Secrets.")
     st.stop()
 
-engine = create_engine(DB_URL, pool_pre_ping=True)
-global_cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
+if not ATL_CLIENT_ID or not ATL_REDIRECT_URI:
+    st.info("Hinweis: Jira SSO ist noch nicht konfiguriert (ATLASSIAN_CLIENT_ID/ATLASSIAN_REDIRECT_URI in Secrets). PIN-Login ist nutzbar.")
 
+engine = create_engine(DB_URL, pool_pre_ping=True)
+
+# Crypto helpers
+global_cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
+def kdf_from_pin(pin: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(pin.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+def fernet_from_pin(pin: str, salt: bytes) -> Fernet:
+    key = base64.urlsafe_b64encode(kdf_from_pin(pin, salt)); return Fernet(key)
+
+# DB init
 def db_init():
     with engine.begin() as con:
-        # PIN-basierte Tabelle
         con.execute(text("""
         CREATE TABLE IF NOT EXISTS user_pin (
           email TEXT PRIMARY KEY,
@@ -43,70 +57,25 @@ def db_init():
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """))
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS user_oauth (
+          email TEXT PRIMARY KEY,
+          atlassian_account_id TEXT,
+          cloud_id TEXT NOT NULL,
+          site_url TEXT NOT NULL,
+          access_token TEXT NOT NULL,
+          refresh_token TEXT NOT NULL,
+          expires_at TIMESTAMP NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """))
 db_init()
 
-# ----------------------------- Helpers -----------------------------
-def kdf_from_pin(pin: str, salt: bytes) -> bytes:
-    # 32-Byte-Schlüssel aus PIN ableiten (scrypt)
-    return hashlib.scrypt(pin.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
-
-def fernet_from_pin(pin: str, salt: bytes) -> Fernet:
-    key = base64.urlsafe_b64encode(kdf_from_pin(pin, salt))
-    return Fernet(key)
-
-def set_pin_credentials(email: str, base_url: str, api_token: str, account_id: str, pin: str):
-    salt = os.urandom(16)
-    f = fernet_from_pin(pin, salt)
-    enc_token = f.encrypt(api_token.encode()).decode()
-    with engine.begin() as con:
-        con.execute(text("""
-        INSERT INTO user_pin (email, salt, enc_token, jira_base_url, account_id, updated_at)
-        VALUES (:email, :salt, :enc, :url, :acc, CURRENT_TIMESTAMP)
-        ON CONFLICT (email) DO UPDATE SET
-          salt = EXCLUDED.salt,
-          enc_token = EXCLUDED.enc_token,
-          jira_base_url = EXCLUDED.jira_base_url,
-          account_id = EXCLUDED.account_id,
-          updated_at = CURRENT_TIMESTAMP
-        """), {"email": email, "salt": salt, "enc": enc_token, "url": base_url, "acc": account_id})
-
-def load_pin_row(email: str):
-    with engine.begin() as con:
-        row = con.execute(text("""
-        SELECT salt, enc_token, jira_base_url, account_id FROM user_pin WHERE email=:email
-        """), {"email": email}).fetchone()
-    return row
-
-def delete_pin_row(email: str):
-    with engine.begin() as con:
-        con.execute(text("DELETE FROM user_pin WHERE email=:email"), {"email": email})
-
+# ----------------------------- Jira Clients -----------------------------
 def normalize_base_url(url: str) -> str:
     url=(url or "").strip()
     return url[:-1] if url.endswith("/") else url
 
-# Jira helpers
-P_PATTERN = re.compile(r"^P\d{6}$")
-def is_p_label(label: str) -> bool: return bool(P_PATTERN.match(label or ""))
-def extract_p_label(labels: List[str]) -> Optional[str]:
-    for l in labels or []:
-        if is_p_label(l): return l
-    return None
-def to_started_iso(d: date, t: dtime) -> str:
-    local_tz = datetime.now().astimezone().tzinfo
-    return datetime.combine(d, t).replace(tzinfo=local_tz).strftime("%Y-%m-%dT%H:%M:%S.000%z")
-def ensure_15min(seconds: int) -> bool: return seconds % 900 == 0 and seconds > 0
-def adf_comment(text: str) -> Dict[str, Any]:
-    txt=(text or "").strip() or "Zeiterfassung über Stichwort-Tool"
-    return {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":txt}]}]}
-def fill_template(tpl: str, p: str, key: str, summary: str, d: date) -> str:
-    if not tpl: return ""
-    return tpl.replace("{P}", p or "").replace("{ISSUE}", key or "").replace("{SUMMARY}", summary or "").replace("{DATE}", d.isoformat())
-def week_bounds_from(d: date) -> Tuple[date,date]:
-    monday = d - timedelta(days=d.weekday())
-    return monday, monday+timedelta(days=7)
-
-# ----------------------------- Jira Client -----------------------------
 class JiraError(Exception): pass
 
 class JiraClientBasic:
@@ -114,11 +83,10 @@ class JiraClientBasic:
         self.base_url=normalize_base_url(base_url); self.timeout=timeout
         self.s=requests.Session(); self.s.auth=(email, api_token)
         self.s.headers.update({"Accept":"application/json","Content-Type":"application/json"})
-    def _req(self, method, path, params=None, data=None, retries=3, return_headers=False):
+    def _req(self, method, path, params=None, data=None, retries=3):
         url=f"{self.base_url}{path}"
         for attempt in range(retries):
             r=self.s.request(method,url,params=params,data=data,timeout=self.timeout)
-            if return_headers: return r
             if r.status_code in (429,502,503,504):
                 time.sleep(1.5*(attempt+1)); continue
             if r.status_code>=400:
@@ -163,20 +131,284 @@ class JiraClientBasic:
         return {"worklogs": out}
     def delete_worklog(self, issue_key, worklog_id):
         self._req("DELETE", f"/rest/api/3/issue/{issue_key}/worklog/{worklog_id}")
-    def probe_headers(self):
-        r=self._req("GET","/rest/api/3/myself", return_headers=True)
-        return dict(r.headers), r.status_code
+
+class JiraClientOAuth:
+    AUTH_BASE = "https://auth.atlassian.com"
+    API_BASE  = "https://api.atlassian.com"
+
+    def __init__(self, cloud_id: str, site_url: str, access_token: str, refresh_token: str, expires_at: datetime, client_id: str, client_secret: str = ""):
+        self.cloud_id=cloud_id; self.site_url=site_url
+        self.access_token=access_token; self.refresh_token=refresh_token; self.expires_at=expires_at
+        self.client_id=client_id; self.client_secret=client_secret
+        self.timeout=30
+
+    def _ensure_token(self):
+        # Refresh if expires within 60s
+        if datetime.now(timezone.utc) + timedelta(seconds=60) < self.expires_at:
+            return
+        data = {
+            "grant_type":"refresh_token",
+            "client_id": self.client_id,
+            "refresh_token": self.refresh_token,
+        }
+        if self.client_secret:
+            data["client_secret"] = self.client_secret
+        r=requests.post(f"{self.AUTH_BASE}/oauth/token", json=data, timeout=30, headers={"Content-Type":"application/json"})
+        if r.status_code>=400:
+            raise JiraError(f"Token-Refresh fehlgeschlagen: {r.status_code} {r.text}")
+        j=r.json()
+        self.access_token=j["access_token"]; self.refresh_token=j.get("refresh_token", self.refresh_token)
+        self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(j.get("expires_in", 3600)))
+
+    def _req(self, method, path, params=None, data=None, retries=3):
+        self._ensure_token()
+        url=f"{self.API_BASE}/ex/jira/{self.cloud_id}{path}"
+        headers={"Authorization": f"Bearer {self.access_token}", "Accept":"application/json","Content-Type":"application/json"}
+        for attempt in range(retries):
+            r=requests.request(method,url,params=params,data=data,headers=headers,timeout=self.timeout)
+            if r.status_code in (429,502,503,504):
+                time.sleep(1.5*(attempt+1)); continue
+            if r.status_code==401 and attempt==0:
+                # einmal refresh erzwingen
+                self.expires_at = datetime.now(timezone.utc)  # force refresh
+                self._ensure_token()
+                headers["Authorization"]=f"Bearer {self.access_token}"
+                continue
+            if r.status_code>=400:
+                try: detail=r.json()
+                except Exception: detail=r.text
+                raise JiraError(f"HTTP {r.status_code} für {path}: {detail}")
+            try: return r.json()
+            except Exception: return None
+        raise JiraError(f"Failed after retries: {method} {path}")
+
+    def get_myself(self):   return self._req("GET","/rest/api/3/myself")
+    def list_projects(self, only_led_by: Optional[str] = None):
+        start_at=0; max_results=50; out=[]
+        while True:
+            d=self._req("GET","/rest/api/3/project/search", params={"expand":"lead","startAt":start_at,"maxResults":max_results})
+            for p in d.get("values",[]):
+                if only_led_by:
+                    if (p.get("lead") or {}).get("accountId")==only_led_by: out.append(p)
+                else: out.append(p)
+            if start_at+max_results>=d.get("total",0): break
+            start_at+=max_results
+        return out
+    def search_issues(self, jql, fields, batch_size=100):
+        start_at=0; out=[]
+        while True:
+            d=self._req("POST","/rest/api/3/search", data=json.dumps({"jql":jql,"startAt":start_at,"maxResults":batch_size,"fields":fields}))
+            out.extend(d.get("issues",[])); 
+            if start_at+batch_size>=d.get("total",0): break
+            start_at+=batch_size
+        return out
+    def update_issue_labels(self, issue_key, new_labels):
+        self._req("PUT", f"/rest/api/3/issue/{issue_key}", data=json.dumps({"fields":{"labels":new_labels}}))
+    def add_worklog(self, issue_key, started_iso, seconds, comment_text):
+        d=self._req("POST", f"/rest/api/3/issue/{issue_key}/worklog", data=json.dumps({"started":started_iso,"timeSpentSeconds":seconds,"comment":adf_comment(comment_text)}))
+        return d.get("id")
+    def list_worklogs(self, issue_key):
+        out=[]; startAt=0; maxResults=100
+        while True:
+            d=self._req("GET", f"/rest/api/3/issue/{issue_key}/worklog", params={"startAt":startAt,"maxResults":maxResults})
+            out.extend(d.get("worklogs",[]))
+            if startAt+maxResults>=d.get("total",len(out)): break
+            startAt+=maxResults
+        return {"worklogs": out}
+    def delete_worklog(self, issue_key, worklog_id):
+        self._req("DELETE", f"/rest/api/3/issue/{issue_key}/worklog/{worklog_id}")
+
+# ----------------------------- Jira utilities -----------------------------
+P_PATTERN = re.compile(r"^P\d{6}$")
+def is_p_label(label: str) -> bool: return bool(P_PATTERN.match(label or ""))
+def extract_p_label(labels: List[str]) -> Optional[str]:
+    for l in labels or []:
+        if is_p_label(l): return l
+    return None
+def to_started_iso(d: date, t: dtime) -> str:
+    local_tz = datetime.now().astimezone().tzinfo
+    return datetime.combine(d, t).replace(tzinfo=local_tz).strftime("%Y-%m-%dT%H:%M:%S.000%z")
+def ensure_15min(seconds: int) -> bool: return seconds % 900 == 0 and seconds > 0
+def adf_comment(text: str) -> Dict[str, Any]:
+    txt=(text or "").strip() or "Zeiterfassung über Stichwort-Tool"
+    return {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":txt}]}]}
+def fill_template(tpl: str, p: str, key: str, summary: str, d: date) -> str:
+    if not tpl: return ""
+    return tpl.replace("{P}", p or "").replace("{ISSUE}", key or "").replace("{SUMMARY}", summary or "").replace("{DATE}", d.isoformat())
+def week_bounds_from(d: date) -> Tuple[date,date]:
+    monday = d - timedelta(days=d.weekday())
+    return monday, monday+timedelta(days=7)
+
+# ----------------------------- PIN credentials helpers -----------------------------
+def set_pin_credentials(email: str, base_url: str, api_token: str, account_id: str, pin: str):
+    salt = os.urandom(16)
+    f = fernet_from_pin(pin, salt)
+    enc_token = f.encrypt(api_token.encode()).decode()
+    with engine.begin() as con:
+        con.execute(text("""
+        INSERT INTO user_pin (email, salt, enc_token, jira_base_url, account_id, updated_at)
+        VALUES (:email, :salt, :enc, :url, :acc, CURRENT_TIMESTAMP)
+        ON CONFLICT (email) DO UPDATE SET
+          salt = EXCLUDED.salt,
+          enc_token = EXCLUDED.enc_token,
+          jira_base_url = EXCLUDED.jira_base_url,
+          account_id = EXCLUDED.account_id,
+          updated_at = CURRENT_TIMESTAMP
+        """), {"email": email, "salt": salt, "enc": enc_token, "url": base_url, "acc": account_id})
+
+def load_pin_row(email: str):
+    with engine.begin() as con:
+        row = con.execute(text("""
+        SELECT salt, enc_token, jira_base_url, account_id FROM user_pin WHERE email=:email
+        """), {"email": email}).fetchone()
+    return row
+
+def delete_pin_row(email: str):
+    with engine.begin() as con:
+        con.execute(text("DELETE FROM user_pin WHERE email=:email"), {"email": email})
+
+# ----------------------------- OAuth helpers -----------------------------
+def pkce_pair() -> Tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    return verifier, challenge
+
+def build_authorize_url(state: str, code_challenge: Optional[str]) -> str:
+    q = {
+        "audience": "api.atlassian.com",
+        "client_id": ATL_CLIENT_ID,
+        "scope": ATL_SCOPES,
+        "redirect_uri": ATL_REDIRECT_URI,
+        "state": state,
+        "response_type": "code",
+        "prompt": "consent",
+    }
+    if not ATL_CLIENT_SECRET:  # PKCE public client
+        q["code_challenge"] = code_challenge or ""
+        q["code_challenge_method"] = "S256"
+    return "https://auth.atlassian.com/authorize?" + urllib.parse.urlencode(q)
+
+def oauth_exchange_code(code: str, code_verifier: Optional[str]) -> Dict[str, Any]:
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": ATL_CLIENT_ID,
+        "code": code,
+        "redirect_uri": ATL_REDIRECT_URI,
+    }
+    if ATL_CLIENT_SECRET:
+        data["client_secret"] = ATL_CLIENT_SECRET
+    else:
+        data["code_verifier"] = code_verifier or ""
+    r=requests.post("https://auth.atlassian.com/oauth/token", json=data, headers={"Content-Type":"application/json"}, timeout=30)
+    if r.status_code>=400:
+        raise JiraError(f"Token-Austausch fehlgeschlagen: {r.status_code} {r.text}")
+    return r.json()
+
+def oauth_accessible_resources(access_token: str) -> list:
+    r=requests.get("https://api.atlassian.com/oauth/token/accessible-resources", headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+    if r.status_code>=400:
+        raise JiraError(f"accessible-resources fehlgeschlagen: {r.status_code} {r.text}")
+    return r.json()
+
+def save_oauth_tokens(email: str, account_id: str, cloud_id: str, site_url: str, access_token: str, refresh_token: str, expires_in: int):
+    with engine.begin() as con:
+        con.execute(text("""
+        INSERT INTO user_oauth (email, atlassian_account_id, cloud_id, site_url, access_token, refresh_token, expires_at, updated_at)
+        VALUES (:email,:acc,:cid,:url,:at,:rt,:exp,CURRENT_TIMESTAMP)
+        ON CONFLICT (email) DO UPDATE SET
+          atlassian_account_id = EXCLUDED.atlassian_account_id,
+          cloud_id = EXCLUDED.cloud_id,
+          site_url = EXCLUDED.site_url,
+          access_token = EXCLUDED.access_token,
+          refresh_token = EXCLUDED.refresh_token,
+          expires_at = EXCLUDED.expires_at,
+          updated_at = CURRENT_TIMESTAMP
+        """), {
+            "email": email, "acc": account_id, "cid": cloud_id, "url": site_url,
+            "at": access_token, "rt": refresh_token, "exp": datetime.now(timezone.utc) + timedelta(seconds=int(expires_in or 3600))
+        })
+
+def load_oauth_row(email: str):
+    with engine.begin() as con:
+        row = con.execute(text("""
+        SELECT atlassian_account_id, cloud_id, site_url, access_token, refresh_token, expires_at
+        FROM user_oauth WHERE email=:email
+        """), {"email": email}).fetchone()
+    return row
+
+def delete_oauth_row(email: str):
+    with engine.begin() as con:
+        con.execute(text("DELETE FROM user_oauth WHERE email=:email"), {"email": email})
 
 # ----------------------------- UI State -----------------------------
-st.title("Jira Stichwort-Zuordnung — PRO v5 (PIN-Login)")
-st.caption("E-Mail+PIN • keine Cookies • Timesheet • Health-Check+ • Multi-Projekt")
+st.title("Jira Stichwort-Zuordnung — PRO v6 (SSO + PIN)")
+st.caption("Bevorzugt: Jira SSO (OAuth 3LO). Fallback: E-Mail + PIN.")
 
-for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev"]: 
+for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev","oauth_in_progress","oauth_state","oauth_verifier"]: 
     st.session_state.setdefault(k, None)
 
-# ----------------------------- Login & Setup -----------------------------
-login_mode = st.sidebar.radio("Login-Variante", ["Schnell-Login (E-Mail + PIN)", "Erstkonfiguration / Token ändern"], index=0)
+# ----------------------------- Login Modes -----------------------------
+login_mode = st.sidebar.radio("Login-Variante", ["Jira SSO", "Schnell-Login (E-Mail + PIN)", "Erstkonfiguration / Token ändern"], index=0)
 
+# --- Jira SSO ---
+if login_mode == "Jira SSO":
+    st.sidebar.subheader("Jira Single Sign-On")
+    if not ATL_CLIENT_ID or not ATL_REDIRECT_URI:
+        st.sidebar.warning("SSO ist noch nicht konfiguriert. Bitte Secrets setzen: ATLASSIAN_CLIENT_ID, ATLASSIAN_REDIRECT_URI (und optional ATLASSIAN_CLIENT_SECRET).")
+    else:
+        # 1) Callback prüfen
+        params = st.query_params
+        code = params.get("code")
+        state = params.get("state")
+        if code and state and state == st.session_state.get("oauth_state"):
+            try:
+                j = oauth_exchange_code(code, st.session_state.get("oauth_verifier"))
+                access_token=j["access_token"]; refresh_token=j.get("refresh_token"); expires_in=int(j.get("expires_in",3600))
+                # Ressourcen holen
+                resources=oauth_accessible_resources(access_token)
+                if not resources:
+                    st.sidebar.error("Kein Jira-Workspace gefunden.")
+                else:
+                    # Auswahl, wenn mehrere Sites
+                    opts = [f'{r.get("name")} — {r.get("url")} ({r.get("id")})' for r in resources]
+                    chosen = st.sidebar.selectbox("Workspace wählen", opts, index=0, key="sso_site_select")
+                    idx = opts.index(chosen)
+                    res = resources[idx]
+                    cloud_id = res.get("id"); site_url = res.get("url")
+                    # Myself
+                    headers={"Authorization": f"Bearer {access_token}"}
+                    r_me = requests.get(f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/myself", headers=headers, timeout=30)
+                    if r_me.status_code>=400:
+                        st.sidebar.error(f"/myself fehlgeschlagen: {r_me.status_code} {r_me.text}")
+                    else:
+                        me = r_me.json()
+                        email = me.get("emailAddress","") or st.text_input("E-Mail (für Profil-Speicherung)", value="", key="sso_email_fallback")
+                        save_oauth_tokens(email or "sso-user", me.get("accountId",""), cloud_id, site_url, access_token, refresh_token, expires_in)
+                        # Client setzen
+                        client = JiraClientOAuth(cloud_id, site_url, access_token, refresh_token, datetime.now(timezone.utc)+timedelta(seconds=expires_in), ATL_CLIENT_ID, ATL_CLIENT_SECRET or "")
+                        st.session_state.jira=client; st.session_state.myself=me; st.session_state.site_url=site_url; st.session_state.sidebar_collapsed=True
+                        # Query aufräumen
+                        st.query_params.clear()
+                        st.sidebar.success(f"Verbunden als: {me.get('displayName')}")
+            except Exception as e:
+                st.sidebar.error(f"SSO Fehler: {e}")
+        # 2) Login-Button
+        if st.session_state.get("jira") is None:
+            colA, colB = st.sidebar.columns([1,1])
+            if colA.button("Mit Jira anmelden", key="btn_sso"):
+                state = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+                verifier, challenge = pkce_pair() if not ATL_CLIENT_SECRET else (None, None)
+                st.session_state.oauth_state = state; st.session_state.oauth_verifier = verifier
+                url = build_authorize_url(state, challenge)
+                st.sidebar.write("Weiterleiten…")
+                st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
+            if colB.button("Abmelden (SSO)", key="btn_sso_logout"):
+                for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
+                    st.session_state[k]=None
+                st.sidebar.success("Abgemeldet.")
+                st.rerun()
+
+# --- PIN Schnell-Login ---
 if login_mode == "Schnell-Login (E-Mail + PIN)":
     st.sidebar.subheader("Schnell-Login")
     email = st.sidebar.text_input("E-Mail", value="", key="pin_email")
@@ -191,8 +423,7 @@ if login_mode == "Schnell-Login (E-Mail + PIN)":
         else:
             salt, enc_token, base_url, account_id = row
             try:
-                f = fernet_from_pin(pin, salt)
-                api_token = f.decrypt(enc_token.encode()).decode()
+                f = fernet_from_pin(pin, salt); api_token = f.decrypt(enc_token.encode()).decode()
                 jira = JiraClientBasic(base_url, email, api_token); me = jira.get_myself()
                 st.session_state.jira, st.session_state.myself, st.session_state.site_url = jira, me, base_url
                 st.session_state.sidebar_collapsed=True
@@ -205,7 +436,8 @@ if login_mode == "Schnell-Login (E-Mail + PIN)":
         st.sidebar.success("Abgemeldet.")
         st.rerun()
 
-else:
+# --- PIN Erstkonfiguration ---
+if login_mode == "Erstkonfiguration / Token ändern":
     st.sidebar.subheader("Erstkonfiguration / Token ändern")
     email    = st.sidebar.text_input("E-Mail", value="", key="setup_email")
     base_url = st.sidebar.text_input("Jira Base-URL", value="", key="setup_url")
@@ -219,7 +451,6 @@ else:
             st.sidebar.error("PINs stimmen nicht überein oder leer.")
         else:
             try:
-                # Testverbindung (optional, aber hilfreich)
                 test = JiraClientBasic(base_url, email, api_tok).get_myself()
                 account_id = test.get("accountId","")
                 set_pin_credentials(email, base_url, api_tok, account_id, pin1)
@@ -524,10 +755,6 @@ with tab_reports:
         st.download_button("CSV herunterladen", data=df.to_csv(index=False).encode("utf-8"), file_name="tickets_uebersicht.csv", mime="text/csv", key="rep_csv")
 
 # ----------------------------- Timesheet --------------------------
-def week_bounds_from(d: date) -> Tuple[date,date]:
-    monday = d - timedelta(days=d.weekday())
-    return monday, monday + timedelta(days=7)
-
 with tab_timesheet:
     st.subheader("Wochenansicht / Timesheet")
     today=datetime.now().date()
@@ -597,7 +824,13 @@ with tab_health:
     t_myself,_,e1=timed(jira.get_myself); ok_msgs.append(f"/myself ok ({t_myself*1000:.0f} ms)" if not e1 else f"/myself Fehler: {e1}")
     t_proj,_,e2=timed(jira.list_projects,None); ok_msgs.append(f"/project/search ok ({t_proj*1000:.0f} ms)" if not e2 else f"/project/search Fehler: {e2}")
     try:
-        headers,status=jira.probe_headers(); rl=headers.get("X-RateLimit-Remaining") or headers.get("x-ratelimit-remaining") or "n/a"
+        # Header-Check nur für Basic sinnvoll, aber wir versuchen generisch (OAuth auch liefert Date/Ratelimit)
+        if isinstance(jira, JiraClientBasic):
+            r = requests.get(f"{st.session_state.site_url}/rest/api/3/myself", auth=( "x","x"), timeout=10)
+            headers=dict(r.headers); status=r.status_code
+        else:
+            headers,status = {}, 200
+        rl=headers.get("X-RateLimit-Remaining") or headers.get("x-ratelimit-remaining") or "n/a"
         stime=headers.get("Date")
         skew="n/a"
         if stime:
