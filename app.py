@@ -133,6 +133,10 @@ class JiraClientBasic:
     def my_permissions(self):
         return self._req("GET", "/rest/api/3/mypermissions", params={"projectKey": ""})
 
+    def list_status_names(self):
+        d = self._req("GET", "/rest/api/3/status") or []
+        return {s.get("name") for s in d if s.get("name")}
+
 class JiraClientOAuth:
     AUTH_BASE = "https://auth.atlassian.com"
     API_BASE  = "https://api.atlassian.com"
@@ -210,6 +214,10 @@ class JiraClientOAuth:
         self._req("DELETE", f"/rest/api/3/issue/{issue_key}/worklog/{worklog_id}")
     def my_permissions(self):
         return self._req("GET", "/rest/api/3/mypermissions", params={"projectKey": ""})
+
+    def list_status_names(self):
+        d = self._req("GET", "/rest/api/3/status") or []
+        return {s.get("name") for s in d if s.get("name")}
 
 # ----------------------------- Jira utilities -----------------------------
 P_PATTERN = re.compile(r"^P\d{6}$")
