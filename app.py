@@ -569,34 +569,35 @@ with tab_overview:
     # Schnellaktionen — ENTFERNT in v6.2
 
 # ----------------------------- P-Labels (Hauptbereich) ------------
+
 with tab_plabel:
     st.subheader("P‑Labels zuweisen")
     st.caption("Wähle Tickets in der Tabelle aus **oder** nutze 'Alle in aktueller Ansicht'. Änderungen werden zuerst als Vorschau gezeigt.")
 
     # Tabelle mit Auswahlspalte
-    df_scope=df if st.session_state.multi_proj else (df[df["Project"]==selected_keys[0]] if selected_keys else df)
-    table=df_scope[["Project","Key","Summary","Status","P_Label_Aktuell","Alle_Labels"]].copy()
-    
-table.insert(0,"Auswählen", False)
+    df_scope = df if st.session_state.multi_proj else (df[df["Project"]==selected_keys[0]] if selected_keys else df)
+    table = df_scope[["Project","Key","Summary","Status","P_Label_Aktuell","Alle_Labels"]].copy()
+    table.insert(0, "Auswählen", False)
 
-# Zusatz: Schnell-Selektor
-colsel1, colsel2 = st.columns([1,1])
-if colsel1.button("Alle ohne P‑Label auswählen", key="pl_select_missing"):
-    st.session_state["pl_preselect"] = "missing"
-if colsel2.button("Auswahl leeren", key="pl_select_clear"):
-    st.session_state["pl_preselect"] = "none"
+    # Zusatz: Schnell-Selektor
+    colsel1, colsel2 = st.columns([1,1])
+    if colsel1.button("Alle ohne P‑Label auswählen", key="pl_select_missing"):
+        st.session_state["pl_preselect"] = "missing"
+    if colsel2.button("Auswahl leeren", key="pl_select_clear"):
+        st.session_state["pl_preselect"] = "none"
 
-pre = st.session_state.get("pl_preselect")
-if pre == "missing":
-    try:
-        table.loc[table["P_Label_Aktuell"]=="","Auswählen"] = True
-    except Exception:
-        pass
-elif pre == "none":
-    table["Auswählen"] = False
-st.session_state["pl_preselect"] = None
+    pre = st.session_state.get("pl_preselect")
+    if pre == "missing":
+        try:
+            table.loc[table["P_Label_Aktuell"]=="", "Auswählen"] = True
+        except Exception:
+            pass
+    elif pre == "none":
+        table["Auswählen"] = False
+    if pre:
+        st.session_state["pl_preselect"] = None
 
-edited = st.data_editor(
+    edited = st.data_editor(
         table,
         use_container_width=True,
         hide_index=True,
@@ -608,9 +609,9 @@ edited = st.data_editor(
         key="pl_editor",
     )
 
-    selection_keys = edited.loc[edited["Auswählen"]==True,"Key"].tolist()
-    colp1,colp2 = st.columns([2,1])
-    p_number=colp1.text_input("Projektnummer (PXXXXXX)", value="", key="pl_p_number")
+    selection_keys = edited.loc[edited["Auswählen"]==True, "Key"].tolist()
+    colp1, colp2 = st.columns([2,1])
+    p_number = colp1.text_input("Projektnummer (PXXXXXX)", value="", key="pl_p_number")
     mode_all = colp2.toggle("Alle in aktueller Ansicht verwenden", value=False, key="pl_all_mode")
 
     if st.button("Änderungen prüfen", key="pl_preview_btn"):
@@ -620,40 +621,44 @@ edited = st.data_editor(
         elif not (p_number and P_PATTERN.match(p_number)):
             st.error("Ungültige Projektnummer. Format: PXXXXXX (6 Ziffern).")
         else:
-            rows=[]
+            rows = []
             for k in target:
-                r=df_scope.loc[df_scope["Key"]==k].iloc[0]
-                old=[l.strip() for l in (r["Alle_Labels"].split(",") if r["Alle_Labels"] else []) if l.strip()]
-                base=[l for l in old if not is_p_label(l)]
-                new=base+[p_number]
-                changed = set(old)!=set(new)
+                r = df_scope.loc[df_scope["Key"]==k].iloc[0]
+                old = [l.strip() for l in (r["Alle_Labels"].split(",") if r["Alle_Labels"] else []) if l.strip()]
+                base = [l for l in old if not is_p_label(l)]
+                new = base + [p_number]
+                changed = set(old) != set(new)
                 rows.append({"Key":k,"Alt":", ".join(old),"Neu":", ".join(new),"Ändert sich?":"Ja" if changed else "Nein"})
-            st.session_state.pl_preview={"p": p_number, "rows": rows}
+            st.session_state.pl_preview = {"p": p_number, "rows": rows}
             st.success("Vorschau erstellt. Bitte prüfen und anschließend bestätigen.")
 
     if st.session_state.pl_preview:
         st.markdown("#### Vorschau: P‑Label‑Änderungen")
-        df_prev=pd.DataFrame(st.session_state.pl_preview["rows"])
+        df_prev = pd.DataFrame(st.session_state.pl_preview["rows"])
         st.dataframe(df_prev, use_container_width=True, hide_index=True)
-        cprev1,cprev2 = st.columns([1,1])
+        cprev1, cprev2 = st.columns([1,1])
         if cprev1.button("✅ Bestätigen & Anwenden", key="pl_apply"):
-            p_val=st.session_state.pl_preview["p"]; prev_state={}; errs=[]
+            p_val = st.session_state.pl_preview["p"]; prev_state = {}; errs = []
             for row in st.session_state.pl_preview["rows"]:
-                k=row["Key"]
+                k = row["Key"]
                 old = [x.strip() for x in row["Alt"].split(",")] if row["Alt"] else []
-                prev_state[k]=old
+                prev_state[k] = old
                 new = [x.strip() for x in row["Neu"].split(",")] if row["Neu"] else []
-                try: jira.update_issue_labels(k, new)
-                except Exception as e: errs.append(f"{k}: {e}")
-            st.session_state.undo={"type":"labels","data":prev_state}
-            st.session_state.pl_preview=None
-            if errs: st.error("Einige Tickets konnten nicht aktualisiert werden:\n- " + "\n- ".join(errs))
-            else: st.success(f"P‑Label `{p_val}` angewandt."); refresh_after_update()
+                try:
+                    jira.update_issue_labels(k, new)
+                except Exception as e:
+                    errs.append(f"{k}: {e}")
+            st.session_state.undo = {"type":"labels","data":prev_state}
+            st.session_state.pl_preview = None
+            if errs:
+                st.error("Einige Tickets konnten nicht aktualisiert werden:\n- " + "\n- ".join(errs))
+            else:
+                st.success(f"P‑Label `{p_val}` angewandt.")
+            refresh_after_update()
         if cprev2.button("Abbrechen", key="pl_cancel"):
-            st.session_state.pl_preview=None
+            st.session_state.pl_preview = None
             st.info("Vorschau verworfen.")
 
-# ----------------------------- Worklog (Einzeln) -------------------
 with tab_worklog:
     st.subheader("Worklog (Einzel)")
     csel1,csel2=st.columns([2,1])
