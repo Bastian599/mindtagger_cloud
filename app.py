@@ -577,7 +577,7 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
         resolution=(f.get("resolution") or {}).get("name","")
         # Client-side safety filter
         if status in {"Abgebrochen","Geschlossen","Closed"}: continue
-                labels=f.get("labels") or []
+        labels=f.get("labels") or []
         p_label=extract_p_label(labels); link=f"{site_url}/browse/{k}" if site_url else ""
         rows.append({"Project":proj,"Key":k,"Ticket":link,"Summary":summary,"Status":status,"P_Label_Aktuell":p_label or "", "Alle_Labels":", ".join(labels) if labels else ""})
     return pd.DataFrame(rows)
