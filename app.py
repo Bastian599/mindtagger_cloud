@@ -411,7 +411,7 @@ if login_mode == "Jira SSO":
             if colB.button("Abmelden (SSO)", key="btn_sso_logout"):
                 for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
                     st.session_state[k]=None
-                st.sidebar.success("Abgemeldet."); st.rerun()
+                st.sidebar.success("Abgemeldet.")
 
 # --- PIN Schnell-Login ---
 if login_mode == "Schnell-Login (E-Mail + PIN)":
@@ -433,7 +433,7 @@ if login_mode == "Schnell-Login (E-Mail + PIN)":
     if colR.button("Logout", key="btn_logout"):
         for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
             st.session_state[k]=None
-        st.sidebar.success("Abgemeldet."); st.rerun()
+        st.sidebar.success("Abgemeldet.")
 
 # --- PIN Erstkonfiguration ---
 if login_mode == "Erstkonfiguration / Token ändern":
@@ -466,9 +466,9 @@ def hide_sidebar_css():
     st.markdown("""<style>[data-testid="stSidebar"]{display:none!important}.block-container{padding-top:1rem}</style>""", unsafe_allow_html=True)
 if st.session_state.get("sidebar_collapsed", False):
     hide_sidebar_css()
-    if st.button("⚙️ Einstellungen anzeigen"): st.session_state.sidebar_collapsed=False; st.rerun()
+    if st.button("⚙️ Einstellungen anzeigen"): st.session_state.sidebar_collapsed=False
 else:
-    st.sidebar.button("↩︎ Sidebar einklappen", on_click=lambda: (st.session_state.update({"sidebar_collapsed": True}), st.rerun()))
+    st.sidebar.button("↩︎ Sidebar einklappen", on_click=lambda: st.session_state.update({"sidebar_collapsed": True}))
 
 jira=st.session_state.jira; me=st.session_state.myself; site_url=st.session_state.site_url
 
@@ -509,7 +509,7 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
     if not project_keys: 
         return pd.DataFrame(columns=["Project","Key","Ticket","Summary","Status","P_Label_Aktuell","Alle_Labels"])
     quoted = ",".join([f'"{k}"' for k in project_keys])
-    jql = f'project in ({quoted}) AND status not in ("Closed","Geschlossen") ORDER BY created DESC'
+    jql = f'project in ({quoted}) AND status not in ("Closed","Geschlossen","Abgebrochen","Cancelled") ORDER BY created DESC'
     fields = ["summary","status","labels","project"]
     issues = _jira_client.search_issues(jql, fields)
     rows=[]
@@ -576,9 +576,27 @@ with tab_plabel:
     # Tabelle mit Auswahlspalte
     df_scope=df if st.session_state.multi_proj else (df[df["Project"]==selected_keys[0]] if selected_keys else df)
     table=df_scope[["Project","Key","Summary","Status","P_Label_Aktuell","Alle_Labels"]].copy()
-    table.insert(0,"Auswählen", False)
+    
+table.insert(0,"Auswählen", False)
 
-    edited = st.data_editor(
+# Zusatz: Schnell-Selektor
+colsel1, colsel2 = st.columns([1,1])
+if colsel1.button("Alle ohne P‑Label auswählen", key="pl_select_missing"):
+    st.session_state["pl_preselect"] = "missing"
+if colsel2.button("Auswahl leeren", key="pl_select_clear"):
+    st.session_state["pl_preselect"] = "none"
+
+pre = st.session_state.get("pl_preselect")
+if pre == "missing":
+    try:
+        table.loc[table["P_Label_Aktuell"]=="","Auswählen"] = True
+    except Exception:
+        pass
+elif pre == "none":
+    table["Auswählen"] = False
+st.session_state["pl_preselect"] = None
+
+edited = st.data_editor(
         table,
         use_container_width=True,
         hide_index=True,
@@ -849,8 +867,8 @@ with tab_timesheet:
     today=datetime.now().date()
     colts1,colts2,colts3,colts4=st.columns([2,1,1,2])
     wk_date=colts1.date_input("Woche auswählen (beliebiges Datum der Woche)", value=today, key="ts_date")
-    if colts2.button("‹ Vorwoche", key="ts_prev"): st.session_state.ts_date=wk_date - timedelta(days=7); st.rerun()
-    if colts3.button("Nächste Woche ›", key="ts_next"): st.session_state.ts_date=wk_date + timedelta(days=7); st.rerun()
+    if colts2.button("‹ Vorwoche", key="ts_prev"): st.session_state.ts_date=wk_date - timedelta(days=7)
+    if colts3.button("Nächste Woche ›", key="ts_next"): st.session_state.ts_date=wk_date + timedelta(days=7)
     mine_only=colts4.toggle("Nur eigene Worklogs", value=True, key="ts_mine")
 
     def week_bounds_from(d: date) -> Tuple[date,date]:
