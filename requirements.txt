@@ -2,3 +2,7 @@ streamlit==1.37.1
 requests==2.32.3
 pandas==2.2.2
 openpyxl==3.1.5
+SQLAlchemy==2.0.31
+cryptography==42.0.8
+extra-streamlit-components==0.1.60
+psycopg2-binary==2.9.9

@@ -1,30 +1,79 @@
-# app.py — Jira Stichwort-Zuordnung PRO v3 (Cloud-ready, patched)
-# Fixes:
-# - Lead-Only Toggle invalidates project cache
-# - No sticky "no secrets" info (silent before login)
-# - timezone-aware UTC (no datetime.utcnow deprecation)
-
-import os, re, io, time, json
+# app.py — Jira Stichwort-Zuordnung PRO v4 (Cloud, per-user Cookies + DB)
+import os, re, io, time, json, base64
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, date, time as dtime, timedelta, timezone
 
 import requests
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, text
+from cryptography.fernet import Fernet
+import extra_streamlit_components as stx
 
-st.set_page_config(page_title="Jira Stichwort-Zuordnung PRO v3 — Cloud", layout="wide")
+st.set_page_config(page_title="Jira Stichwort-Zuordnung PRO v4 — Cloud", layout="wide")
 
 def _sec(name: str, default: str = "") -> str:
-    try:
-        return st.secrets.get(name, default)  # type: ignore[attr-defined]
-    except Exception:
-        return os.getenv(name, default)
+    try: return st.secrets.get(name, default)  # type: ignore[attr-defined]
+    except Exception: return os.getenv(name, default)
 
-DEFAULTS = {
-    "JIRA_BASE_URL":      _sec("JIRA_BASE_URL", ""),
-    "JIRA_EMAIL":         _sec("JIRA_EMAIL", ""),
-    "JIRA_API_TOKEN":     _sec("JIRA_API_TOKEN", ""),
-}
+DB_URL = _sec("DATABASE_URL", "sqlite:///./creds.db")
+FERNET_KEY = _sec("FERNET_KEY", "")
+if not FERNET_KEY:
+    st.error("Admin-Hinweis: FERNET_KEY fehlt in Secrets.")
+    st.stop()
+
+engine = create_engine(DB_URL, pool_pre_ping=True)
+cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
+cookie = stx.CookieManager()
+
+def enc_to_str(s: str) -> str: return base64.b64encode(cipher.encrypt(s.encode())).decode()
+def dec_from_str(txt: str) -> str: return cipher.decrypt(base64.b64decode(txt.encode())).decode()
+
+def db_init():
+    with engine.begin() as con:
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS user_credentials (
+          account_id     TEXT PRIMARY KEY,
+          jira_base_url  TEXT NOT NULL,
+          email          TEXT NOT NULL,
+          enc_token      TEXT NOT NULL,
+          created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """))
+db_init()
+
+def save_creds(account_id: str, base_url: str, email: str, api_token: str):
+    with engine.begin() as con:
+        con.execute(text("""
+        INSERT INTO user_credentials (account_id, jira_base_url, email, enc_token, updated_at)
+        VALUES (:aid, :url, :mail, :tok, CURRENT_TIMESTAMP)
+        ON CONFLICT (account_id) DO UPDATE SET
+          jira_base_url = EXCLUDED.jira_base_url,
+          email        = EXCLUDED.email,
+          enc_token    = EXCLUDED.enc_token,
+          updated_at   = CURRENT_TIMESTAMP
+        """), {"aid": account_id, "url": base_url, "mail": email, "tok": enc_to_str(api_token)})
+
+def load_creds(account_id: str):
+    with engine.begin() as con:
+        row = con.execute(text("""
+          SELECT jira_base_url, email, enc_token
+          FROM user_credentials WHERE account_id=:aid
+        """), {"aid": account_id}).fetchone()
+    if not row: return None
+    return {"base_url": row[0], "email": row[1], "api_token": dec_from_str(row[2])}
+
+def delete_creds(account_id: str):
+    with engine.begin() as con:
+        con.execute(text("DELETE FROM user_credentials WHERE account_id=:aid"), {"aid": account_id})
+
+def set_user_cookie(account_id: str):
+    exp = (datetime.now(timezone.utc) + timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    cookie.set("jira_user", account_id, expires=exp, key="jira_cookie")
+
+def get_user_cookie() -> Optional[str]: return cookie.get("jira_user")
+def clear_user_cookie(): cookie.delete("jira_user", key="jira_cookie")
 
 P_PATTERN = re.compile(r"^P\d{6}$")
 def is_p_label(label: str) -> bool: return bool(P_PATTERN.match(label or ""))
@@ -44,6 +93,9 @@ def adf_comment(text: str) -> Dict[str, Any]:
 def fill_template(tpl: str, p: str, key: str, summary: str, d: date) -> str:
     if not tpl: return ""
     return tpl.replace("{P}", p or "").replace("{ISSUE}", key or "").replace("{SUMMARY}", summary or "").replace("{DATE}", d.isoformat())
+def week_bounds_from(d: date) -> Tuple[date,date]:
+    monday = d - timedelta(days=d.weekday())
+    return monday, monday+timedelta(days=7)
 
 class JiraError(Exception): pass
 def normalize_base_url(url: str) -> str: url=(url or "").strip(); return url[:-1] if url.endswith("/") else url
@@ -106,46 +158,76 @@ class JiraClientBasic:
         r=self._req("GET","/rest/api/3/myself", return_headers=True)
         return dict(r.headers), r.status_code
 
-st.title("Jira Stichwort-Zuordnung — PRO v3 (Cloud)")
-st.caption("Timesheet • Wochensumme • Health-Check+ • Multi-Tab • Multi-Projekt • Cloud Secrets")
+st.title("Jira Stichwort-Zuordnung — PRO v4 (Cloud)")
+st.caption("Per-User-Login (Cookie+DB) • Timesheet • Health-Check+ • Multi-Tab • Multi-Projekt")
 
-for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev","proj_cache_filter"]: 
+for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev"]: 
     st.session_state.setdefault(k, None)
 
-# Login (silent if not connected)
-st.sidebar.header("API Token Einstellungen")
-base_url = st.sidebar.text_input("Jira Base-URL", value=DEFAULTS["JIRA_BASE_URL"])
-email    = st.sidebar.text_input("E-Mail", value=DEFAULTS["JIRA_EMAIL"])
-api_token= st.sidebar.text_input("API Token", type="password", value=DEFAULTS["JIRA_API_TOKEN"])
-c1,c2 = st.sidebar.columns(2)
-connect = c1.button("Verbinden"); logout = c2.button("Logout")
-if logout:
-    for k in ["jira","myself","site_url","projects_cache","own_only_prev","proj_cache_filter"]: st.session_state[k]=None
+if not st.session_state.get("jira"):
+    aid = get_user_cookie()
+    if aid:
+        creds = load_creds(aid)
+        if creds:
+            try:
+                jira = JiraClientBasic(creds["base_url"], creds["email"], creds["api_token"])
+                me = jira.get_myself()
+                st.session_state.jira=jira; st.session_state.myself=me; st.session_state.site_url=creds["base_url"]
+                st.session_state.sidebar_collapsed=True
+            except Exception as e:
+                st.sidebar.warning("Auto-Login fehlgeschlagen – bitte neu anmelden.")
 
-# Auto-connect via secrets (only if all present)
-if (DEFAULTS["JIRA_BASE_URL"] and DEFAULTS["JIRA_EMAIL"] and DEFAULTS["JIRA_API_TOKEN"] and not st.session_state.get("jira") and not connect):
+st.sidebar.header("Anmeldung (pro Benutzer)")
+base_url  = st.sidebar.text_input("Jira Base-URL", value="")
+email     = st.sidebar.text_input("E-Mail", value="")
+api_token = st.sidebar.text_input("API Token", type="password", value="")
+remember  = st.sidebar.checkbox("Auf diesem Gerät merken", value=True)
+colL, colR = st.sidebar.columns(2)
+connect = colL.button("Verbinden")
+logout  = colR.button("Logout")
+
+colA, colB = st.sidebar.columns(2)
+forget_device = colA.button("Dieses Gerät vergessen")
+delete_saved  = colB.button("Gespeicherte Daten löschen")
+
+if forget_device:
+    clear_user_cookie()
+    st.sidebar.success("Geräte-Cookie gelöscht.")
+
+if delete_saved:
     try:
-        jira = JiraClientBasic(DEFAULTS["JIRA_BASE_URL"], DEFAULTS["JIRA_EMAIL"], DEFAULTS["JIRA_API_TOKEN"])
-        me = jira.get_myself()
-        st.session_state.jira=jira; st.session_state.myself=me; st.session_state.site_url=DEFAULTS["JIRA_BASE_URL"]
-        st.session_state.sidebar_collapsed=True
+        if st.session_state.get("myself"):
+            delete_creds(st.session_state["myself"]["accountId"])
+            st.sidebar.success("Gespeicherte Zugangsdaten gelöscht.")
+        else:
+            aid = get_user_cookie()
+            if aid: delete_creds(aid); st.sidebar.success("Gespeicherte Zugangsdaten gelöscht.")
     except Exception as e:
-        # Zeige nur in Sidebar kompakt, kein permanentes Error-Panel
-        st.sidebar.error(f"Login fehlgeschlagen: {e}")
+        st.sidebar.error(f"Konnte nicht löschen: {e}")
 
 if connect:
     try:
         jira = JiraClientBasic(base_url, email, api_token); me = jira.get_myself()
         st.session_state.jira=jira; st.session_state.myself=me; st.session_state.site_url=base_url
         st.session_state.sidebar_collapsed=True
+        if remember:
+            save_creds(me["accountId"], base_url, email, api_token)
+            set_user_cookie(me["accountId"])
+        st.success(f"Verbunden als: {me.get('displayName')}")
     except Exception as e:
         st.sidebar.error(f"Verbindungsfehler: {e}")
 
+if logout:
+    clear_user_cookie()
+    for k in ["jira","myself","site_url","projects_cache","own_only_prev"]:
+        st.session_state[k]=None
+    st.rerun()
+
 if not st.session_state.get("jira"):
-    # Keine laute Info – nur UI für Login sichtbar
     st.stop()
 
-# Sidebar collapse
+def hide_sidebar_css():
+    st.markdown("""<style>[data-testid="stSidebar"]{display:none!important}.block-container{padding-top:1rem}</style>""", unsafe_allow_html=True)
 if st.session_state.get("sidebar_collapsed", False):
     hide_sidebar_css()
     if st.button("⚙️ Einstellungen anzeigen"): st.session_state.sidebar_collapsed=False; st.rerun()
@@ -154,10 +236,8 @@ else:
 
 jira=st.session_state.jira; me=st.session_state.myself; site_url=st.session_state.site_url
 
-# Lead-only toggle with cache invalidation
 def _invalidate_projects():
     st.session_state.projects_cache=None
-    st.session_state.proj_cache_filter = st.session_state.get("own_only_toggle", False)
 
 own_only = st.toggle("Nur Projekte, bei denen ich Lead bin", value=bool(st.session_state.get("own_only_prev") or False), key="own_only_toggle", on_change=_invalidate_projects)
 if st.session_state.own_only_prev is None or st.session_state.own_only_prev != own_only:
@@ -213,6 +293,7 @@ tab_overview, tab_plabel, tab_worklog, tab_csv, tab_reports, tab_timesheet, tab_
     ["📋 Übersicht","🏷️ P-Labels","⏱️ Worklog (Einzeln)","📥 CSV-Import","📊 Reports & Export","🗓️ Timesheet","🩺 Health-Check+"]
 )
 
+from collections import Counter
 with tab_overview:
     st.subheader("Übersicht & Filter")
     colf1,colf2,colf3,colf4=st.columns([2,1,1,1])
@@ -221,16 +302,22 @@ with tab_overview:
     chosen_status=colf2.multiselect("Status-Filter", status_vals, default=[], key="ov_status")
     only_missing=colf3.toggle("Nur ohne P-Label", value=False, key="ov_only_missing")
     proj_filter=colf4.multiselect("Projektfilter", sorted(df["Project"].unique().tolist()), default=sorted(df["Project"].unique().tolist()), key="ov_proj_filter")
+
     df_view=df.copy()
     if q:
         ql=q.lower(); df_view=df_view[df_view["Summary"].str.lower().str.contains(ql)|df_view["Key"].str.lower().str.contains(ql)]
     if chosen_status: df_view=df_view[df_view["Status"].isin(chosen_status)]
     if only_missing: df_view=df_view[df_view["P_Label_Aktuell"]==""]
     if proj_filter: df_view=df_view[df_view["Project"].isin(proj_filter)]
+
     c1,c2,c3,c4=st.columns([1,1,1,2])
     c1.metric("Tickets", len(df_view))
     c2.metric("Mit P-Label", int((df_view["P_Label_Aktuell"]!="").sum()) if not df_view.empty else 0)
     c3.metric("Ohne P-Label", int((df_view["P_Label_Aktuell"]=="").sum()) if not df_view.empty else 0)
+    existing_ps=[x for x in df_view["P_Label_Aktuell"].tolist() if x]
+    suggested_p=Counter(existing_ps).most_common(1)[0][0] if existing_ps else ""
+    c4.write("Empf. Projektnummer: " + (f"`{suggested_p}`" if suggested_p else "—"))
+
     st.dataframe(df_view, use_container_width=True, hide_index=True, column_config={
         "Ticket": st.column_config.LinkColumn("Ticket öffnen", display_text="Open"),
         "Project": st.column_config.TextColumn("Projekt"),
@@ -240,6 +327,33 @@ with tab_overview:
         "P_Label_Aktuell": st.column_config.TextColumn("P-Label"),
         "Alle_Labels": st.column_config.TextColumn("Alle Labels"),
     })
+
+    st.markdown("### Schnellaktionen")
+    colqa1,colqa2,colqa3=st.columns([3,2,2])
+    qa_key=colqa1.selectbox("Ticket", df_view["Key"].tolist() if not df_view.empty else [], key="qa_key_select")
+    qa_start=colqa2.time_input("Startzeit", value=datetime.now().time().replace(second=0, microsecond=0), key="qa_start_time")
+    qa_date=colqa3.date_input("Datum", value=datetime.now().date(), key="qa_date")
+
+    if not df_view.empty and qa_key:
+        proj_of_issue=df_view.loc[df_view["Key"]==qa_key,"Project"].iloc[0]
+        p_val=df_view.loc[df_view["Key"]==qa_key,"P_Label_Aktuell"].iloc[0]
+        summ=df_view.loc[df_view["Key"]==qa_key,"Summary"].iloc[0]
+        qa_desc=fill_template("", p_val, qa_key, summ, qa_date)
+    else: qa_desc=""
+    st.text_area("Beschreibung (Template anwendbar)", value=qa_desc, key="qa_desc", height=80)
+
+    def quick_add(minutes:int):
+        seconds=minutes*60
+        if not ensure_15min(seconds): st.error("Nur Vielfaches von 15 min erlaubt."); return
+        if not qa_key: st.error("Ticket wählen."); return
+        try:
+            wid=jira.add_worklog(qa_key, to_started_iso(qa_date, qa_start), seconds, st.session_state.get("qa_desc",""))
+            st.session_state.undo={"type":"worklogs","data":[(qa_key,wid)]}; st.success(f"+{minutes}m auf {qa_key} erfasst.")
+        except Exception as e: st.error(f"Fehler: {e}")
+    cq1,cq2,cq3=st.columns(3)
+    if cq1.button("+15m", key="qa_15"): quick_add(15)
+    if cq2.button("+30m", key="qa_30"): quick_add(30)
+    if cq3.button("+1h",  key="qa_60"): quick_add(60)
 
 with tab_plabel:
     st.subheader("P-Label Zuweisung (Dry-Run möglich)")
@@ -262,7 +376,8 @@ with tab_plabel:
         target=keys_all
         if not p_number or not P_PATTERN.match(p_number): st.error("Ungültige P-Nummer.")
         else:
-            if dry_run_labels: st.dataframe(build_label_preview(target, p_number), use_container_width=True, hide_index=True)
+            if dry_run_labels:
+                st.info("Dry-Run aktiv – Vorschau:"); st.dataframe(build_label_preview(target, p_number), use_container_width=True, hide_index=True)
             else:
                 prev={}
                 for k in target:
@@ -277,7 +392,8 @@ with tab_plabel:
         if not target: st.info("Keine Auswahl.")
         elif not p_number or not P_PATTERN.match(p_number): st.error("Ungültige P-Nummer.")
         else:
-            if dry_run_labels: st.dataframe(build_label_preview(target, p_number), use_container_width=True, hide_index=True)
+            if dry_run_labels:
+                st.info("Dry-Run aktiv – Vorschau:"); st.dataframe(build_label_preview(target, p_number), use_container_width=True, hide_index=True)
             else:
                 prev={}
                 for k in target:
@@ -292,14 +408,16 @@ with tab_worklog:
     st.subheader("Worklog (Einzel)")
     csel1,csel2=st.columns([2,1])
     issue_choice=csel1.selectbox("Ticket (aus Liste)", df["Key"].tolist() if not df.empty else [], key="wl_key_select")
-    issue_direct=csel2.text_input("Oder Key direkt", value="", key="wl_key_direct")
+    issue_direct=csel2.text_input("Oder Key direkt (z.B. PROJ-123)", value="", key="wl_key_direct")
     use_key=issue_direct.strip() or issue_choice
+
     c1,c2=st.columns(2)
     work_date=c1.date_input("Datum", value=datetime.now().date(), key="wl_date")
     start_time=c2.time_input("Startzeit", value=datetime.now().time().replace(second=0, microsecond=0), key="wl_start_time")
     cc1,cc2=st.columns([1,1])
     hours=cc1.number_input("Stunden", min_value=0, max_value=24, step=1, value=0, key="wl_hours")
     minutes=cc2.selectbox("Minuten", [0,15,30,45], index=1, key="wl_minutes")
+
     desc=st.text_area("Tätigkeitsbeschreibung", value="", placeholder="Was wurde gemacht?", key="wl_desc")
     if st.button("Zeit erfassen", key="wl_submit"):
         seconds=int(hours)*3600 + int(minutes)*60
@@ -313,12 +431,13 @@ with tab_worklog:
 
 with tab_csv:
     st.subheader("CSV-Import Zeiterfassung")
-    st.caption("Spalten: Ticketnummer;Datum;benötigte Zeit in h  | optional: Uhrzeit, Beschreibung")
+    st.caption("Spalten: **Ticketnummer;Datum;benötigte Zeit in h** | optional: **Uhrzeit, Beschreibung**")
     sample="Ticketnummer;Datum;benötigte Zeit in h;Uhrzeit;Beschreibung\nPROJ-101;21.08.2025;0,25;12:30;Daily Standup\nPROJ-202;21.08.2025;1.5;09:00;Konzept & Abstimmung\n"
     st.download_button("Beispiel-CSV herunterladen", data=sample.encode("utf-8"), file_name="worklog_beispiel.csv", mime="text/csv", key="csv_sample")
     default_desc=st.text_input("Standardbeschreibung (optional)", key="csv_default_desc")
     dry_run=st.checkbox("Nur validieren (Dry-Run)", value=True, key="csv_dryrun")
     uploaded=st.file_uploader("CSV hochladen", type=["csv"], key="csv_upload")
+
     if uploaded is not None:
         content=uploaded.read().decode("utf-8-sig")
         try: df_csv=pd.read_csv(io.StringIO(content), sep=None, engine="python")
@@ -330,9 +449,10 @@ with tab_csv:
             return None
         col_ticket=find_col("ticketnummer","ticket","issue","key")
         col_date=find_col("datum","date")
-        col_hours=find_col("benötigte zeit in h","hours")
+        col_hours=find_col("benötigte zeit in h","benoetigte zeit in h","hours")
         col_time=find_col("uhrzeit","zeit","startzeit")
         col_desc=find_col("beschreibung","description","kommentar")
+
         if not (col_ticket and col_date and col_hours):
             st.error("Pflichtspalten fehlen. Erwartet: Ticketnummer; Datum; benötigte Zeit in h")
         else:
@@ -346,12 +466,12 @@ with tab_csv:
                 except Exception: errors.append(f"{key}: Ungültige Stunden '{raw_hours}'"); continue
                 seconds=int(round(h_float*3600))
                 if seconds%900!=0: errors.append(f"{key}: {h_float}h ist kein Vielfaches von 15 min"); continue
-                if col_time and pd.notna(r[col_time]):
+                if col_time and not pd.isna(r[col_time]):
                     try: parsed_time=pd.to_datetime(str(r[col_time])).time()
                     except Exception: parsed_time=dtime(12,0)
                 else: parsed_time=dtime(12,0)
                 desc_val=""
-                if col_desc and pd.notna(r[col_desc]): desc_val=str(r[col_desc]).strip()
+                if col_desc and not pd.isna(r[col_desc]): desc_val=str(r[col_desc]).strip()
                 elif default_desc: desc_val=default_desc
                 preview_rows.append({"Ticket":key,"Datum":d.isoformat(),"Startzeit":parsed_time.strftime("%H:%M"),"Dauer (min)":seconds//60,"Beschreibung":desc_val or "(leer)"})
             st.write("**Vorschau**"); df_prev=pd.DataFrame(preview_rows); st.dataframe(df_prev, use_container_width=True, hide_index=True)
@@ -393,10 +513,6 @@ with tab_timesheet:
     if colts2.button("‹ Vorwoche", key="ts_prev"): st.session_state.ts_date=wk_date - timedelta(days=7); st.rerun()
     if colts3.button("Nächste Woche ›", key="ts_next"): st.session_state.ts_date=wk_date + timedelta(days=7); st.rerun()
     mine_only=colts4.toggle("Nur eigene Worklogs", value=True, key="ts_mine")
-
-    def week_bounds_from(d: date) -> Tuple[date,date]:
-        monday = d - timedelta(days=d.weekday())
-        return monday, monday+timedelta(days=7)
 
     week_start,_=week_bounds_from(wk_date); days=[week_start+timedelta(days=i) for i in range(7)]
     day_cols=[d.strftime("%a\n%d.%m") for d in days]; st.caption(f"Kalenderwoche: {week_start.isoformat()} bis {(week_start+timedelta(days=6)).isoformat()}")
@@ -441,10 +557,8 @@ with tab_timesheet:
             m=sum([log["Minutes"] for log in logs if log["Date"]==d]); totals[dc]=round(m/60,2); week_total_min+=m
         totals["Summe (h)"]=round(week_total_min/60,2)
         totals_df = pd.DataFrame([totals], columns=df_ts.columns if not df_ts.empty else ["Ticket"]+day_cols+["Summe (h)"])
-        if df_ts.empty:
-            df_ts = totals_df
-        else:
-            df_ts = pd.concat([df_ts, totals_df], ignore_index=True)
+        if df_ts.empty: df_ts = totals_df
+        else: df_ts = pd.concat([df_ts, totals_df], ignore_index=True)
         cts1,cts2=st.columns([1,3]); cts1.metric("Wochensumme (h)", totals["Summe (h)"]); cts2.caption("Letzte Zeile: Tagessummen & Wochensumme")
         st.dataframe(df_ts, use_container_width=True, hide_index=True)
         st.download_button("Timesheet (CSV) herunterladen", data=df_ts.to_csv(index=False).encode("utf-8"), file_name=f"timesheet_{week_start.isoformat()}.csv", mime="text/csv", key="ts_export_csv")
@@ -456,10 +570,8 @@ with tab_health:
         t0=time.time()
         try: res=fn(*a,**kw); return time.time()-t0, res, None
         except Exception as e: return time.time()-t0, None, e
-    # simple checks
     t_myself,_,e1=timed(jira.get_myself); ok_msgs.append(f"/myself ok ({t_myself*1000:.0f} ms)" if not e1 else f"/myself Fehler: {e1}")
     t_proj,_,e2=timed(jira.list_projects,None); ok_msgs.append(f"/project/search ok ({t_proj*1000:.0f} ms)" if not e2 else f"/project/search Fehler: {e2}")
-    # headers + skew (timezone-aware)
     try:
         headers,status=jira.probe_headers(); rl=headers.get("X-RateLimit-Remaining") or headers.get("x-ratelimit-remaining") or "n/a"
         stime=headers.get("Date")
@@ -474,8 +586,6 @@ with tab_health:
     if warn_msgs: st.warning("⚠ " + "\n\n⚠ ".join(warn_msgs))
 
 st.markdown("---")
-def refresh_after_update():
-    fetch_issues_df.clear(); st.experimental_set_query_params(_=str(time.time())); st.rerun()
 if st.session_state.get("undo"):
     u=st.session_state["undo"]
     if u["type"]=="labels":
@@ -484,7 +594,8 @@ if st.session_state.get("undo"):
             for k,old in prev.items():
                 try: jira.update_issue_labels(k, old)
                 except Exception as e: errs.append(f"{k}: {e}")
-            st.session_state.undo=None; st.success("Label-Änderung rückgängig gemacht."); refresh_after_update()
+            st.session_state.undo=None; st.success("Label-Änderung rückgängig gemacht."); 
+            fetch_issues_df.clear(); st.experimental_set_query_params(_=str(time.time())); st.rerun()
     elif u["type"]=="worklogs":
         if st.button("↩️ Letzte Worklogs rückgängig machen", key="undo_wl"):
             errs=[]
