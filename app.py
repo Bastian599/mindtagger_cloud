@@ -191,7 +191,7 @@ class JiraClientOAuth:
             d=self._req("POST","/rest/api/3/search", data=json.dumps({"jql":jql,"startAt":start_at,"maxResults":batch_size,"fields":fields}))
             out.extend(d.get("issues",[])); 
             if start_at+batch_size>=d.get("total",0): break
-            start_at+=max_results  # bug fix: correct paginator step
+            start_at+=batch_size  # paginator step fixed
         return out
     def update_issue_labels(self, issue_key, new_labels):
         self._req("PUT", f"/rest/api/3/issue/{issue_key}", data=json.dumps({"fields":{"labels":new_labels}}))
