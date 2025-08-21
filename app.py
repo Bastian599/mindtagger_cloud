@@ -509,7 +509,7 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
     if not project_keys: 
         return pd.DataFrame(columns=["Project","Key","Ticket","Summary","Status","P_Label_Aktuell","Alle_Labels"])
     quoted = ",".join([f'"{k}"' for k in project_keys])
-    jql = f'project in ({quoted}) AND statusCategory != Done ORDER BY created DESC'
+    jql = f'project in ({quoted}) ORDER BY created DESC'
     fields = ["summary","status","labels","project"]
     issues = _jira_client.search_issues(jql, fields)
     rows=[]
@@ -787,6 +787,57 @@ with tab_reports:
             st.pyplot(fig, use_container_width=True)
         else:
             st.info("Keine Worklogs im Zeitraum gefunden.")
+
+    
+    st.markdown("---")
+    st.subheader("Eigene Zeiterfassungen (global, ohne Projektauswahl)")
+    today=datetime.now().date()
+    colg0,colg1=st.columns([1.5,1])
+    g_start=colg0.date_input("Von", value=today - timedelta(days=30), key="g_from")
+    g_end  =colg1.date_input("Bis (inkl.)", value=today, key="g_to")
+
+    if st.button("Alle eigenen Worklogs laden", key="g_load"):
+        jql=f'worklogAuthor = currentUser() AND worklogDate >= "{g_start.strftime("%Y/%m/%d")}" AND worklogDate <= "{g_end.strftime("%Y/%m/%d")}" ORDER BY updated DESC'
+        fields=["summary","labels","project","status"]
+        issues = jira.search_issues(jql, fields, batch_size=100)
+        logs=[]; errs=[]; prog=st.progress(0.0, text="Lade eigene Worklogs…")
+        for i,it in enumerate(issues, start=1):
+            k=it.get("key"); f=it.get("fields",{})
+            labels=f.get("labels") or []; p_val=extract_p_label(labels) or "(kein P)"
+            try:
+                wl=jira.list_worklogs(k) or {}
+                for w in wl.get("worklogs", []):
+                    try: started=pd.to_datetime(w.get("started"))
+                    except Exception: continue
+                    if started.tzinfo is None: started=started.tz_localize("UTC").astimezone()
+                    d0=started.date()
+                    if g_start <= d0 <= g_end:
+                        if (w.get("author") or {}).get("accountId","") == (me or {}).get("accountId",""):
+                            mins=int(w.get("timeSpentSeconds",0))//60
+                            logs.append({"P":p_val,"Ticket":k,"Date":d0,"Minutes":mins})
+            except Exception as e:
+                errs.append(f"{k}: {e}")
+            prog.progress(i/max(len(issues),1), text=f"Lade eigene Worklogs… ({i}/{len(issues)})")
+        prog.empty()
+        st.session_state.reports_global={"logs":logs,"errors":errs,"start":g_start.isoformat(),"end":g_end.isoformat()}
+
+    repg=st.session_state.get("reports_global")
+    if repg and repg.get("start")==g_start.isoformat() and repg.get("end")==g_end.isoformat():
+        logs,errs=repg["logs"], repg["errors"]
+        if errs:
+            with st.expander("Fehler beim Laden (global)"):
+                for e in errs: st.write(e)
+        if logs:
+            df_rep=pd.DataFrame(logs)
+            agg=df_rep.groupby("P", as_index=False)["Minutes"].sum().sort_values("Minutes", ascending=False)
+            st.dataframe(agg.rename(columns={"Minutes":"Minuten gesamt"}), use_container_width=True, hide_index=True)
+            fig, ax = plt.subplots()
+            ax.pie(agg["Minutes"], labels=agg["P"], autopct=lambda p: f"{p:.1f}%")
+            ax.set_title("Verteilung Aufwände (Minuten) nach P‑Label — Eigene global")
+            st.pyplot(fig, use_container_width=True)
+            st.download_button("CSV (eigene Worklogs, global)", data=df_rep.to_csv(index=False).encode("utf-8"), file_name=f"worklogs_eigene_{g_start.isoformat()}_{g_end.isoformat()}.csv", mime="text/csv", key="g_csv")
+        else:
+            st.info("Keine eigenen Worklogs im Zeitraum gefunden.")
 
     st.markdown("---")
     st.subheader("Export Übersicht")
