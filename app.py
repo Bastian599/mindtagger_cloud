@@ -1,4 +1,9 @@
-# app.py — Jira Stichwort-Zuordnung PRO v4 (Cloud, per-user Cookies + DB)
+# app.py — Jira Stichwort-Zuordnung PRO v4.1 (Cloud, per-user Cookies + DB)
+# Changes in 4.1:
+# - Cookie warmup (prevents re-login after tab close/reopen)
+# - Auto-Connect runs after warmup using cookie.get_all()
+# - st.stop only after sidebar handlers
+
 import os, re, io, time, json, base64
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, date, time as dtime, timedelta, timezone
@@ -10,8 +15,9 @@ from sqlalchemy import create_engine, text
 from cryptography.fernet import Fernet
 import extra_streamlit_components as stx
 
-st.set_page_config(page_title="Jira Stichwort-Zuordnung PRO v4 — Cloud", layout="wide")
+st.set_page_config(page_title="Jira Stichwort-Zuordnung PRO v4.1 — Cloud", layout="wide")
 
+# ----------------------------- Secrets & Defaults -----------------------------
 def _sec(name: str, default: str = "") -> str:
     try: return st.secrets.get(name, default)  # type: ignore[attr-defined]
     except Exception: return os.getenv(name, default)
@@ -19,15 +25,27 @@ def _sec(name: str, default: str = "") -> str:
 DB_URL = _sec("DATABASE_URL", "sqlite:///./creds.db")
 FERNET_KEY = _sec("FERNET_KEY", "")
 if not FERNET_KEY:
-    st.error("Admin-Hinweis: FERNET_KEY fehlt in Secrets.")
+    st.error("Admin-Hinweis: FERNET_KEY fehlt in Secrets. Bitte in Streamlit Secrets setzen.")
     st.stop()
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
 cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
-cookie = stx.CookieManager()
 
-def enc_to_str(s: str) -> str: return base64.b64encode(cipher.encrypt(s.encode())).decode()
-def dec_from_str(txt: str) -> str: return cipher.decrypt(base64.b64decode(txt.encode())).decode()
+# Cookie-Manager mit festem Key
+cookie = stx.CookieManager(key="cookie_mgr_v1")
+
+# --- Cookie-Warmup: Erstes Render initialisiert Cookies, dann sofort rerun ---
+if "cookies_warmed" not in st.session_state:
+    cookie.get_all()  # Frontend initialisiert Cookie-Bridge
+    st.session_state["cookies_warmed"] = True
+    st.experimental_rerun()
+# -----------------------------------------------------------------------------
+
+def enc_to_str(s: str) -> str:
+    return base64.b64encode(cipher.encrypt(s.encode())).decode()
+
+def dec_from_str(txt: str) -> str:
+    return cipher.decrypt(base64.b64decode(txt.encode())).decode()
 
 def db_init():
     with engine.begin() as con:
@@ -70,11 +88,16 @@ def delete_creds(account_id: str):
 
 def set_user_cookie(account_id: str):
     exp = (datetime.now(timezone.utc) + timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
-    cookie.set("jira_user", account_id, expires=exp, key="jira_cookie")
+    cookie.set("jira_user", account_id, expires=exp)  # HttpOnly/SameSite werden lib-seitig gesetzt
 
-def get_user_cookie() -> Optional[str]: return cookie.get("jira_user")
-def clear_user_cookie(): cookie.delete("jira_user", key="jira_cookie")
+def get_user_cookie() -> Optional[str]:
+    cookies = cookie.get_all() or {}
+    return cookies.get("jira_user")
 
+def clear_user_cookie():
+    cookie.delete("jira_user")
+
+# ----------------------------- Helpers -----------------------------
 P_PATTERN = re.compile(r"^P\d{6}$")
 def is_p_label(label: str) -> bool: return bool(P_PATTERN.match(label or ""))
 def extract_p_label(labels: List[str]) -> Optional[str]:
@@ -97,6 +120,7 @@ def week_bounds_from(d: date) -> Tuple[date,date]:
     monday = d - timedelta(days=d.weekday())
     return monday, monday+timedelta(days=7)
 
+# ----------------------------- Jira Client (Basic) ------------------------
 class JiraError(Exception): pass
 def normalize_base_url(url: str) -> str: url=(url or "").strip(); return url[:-1] if url.endswith("/") else url
 
@@ -158,12 +182,14 @@ class JiraClientBasic:
         r=self._req("GET","/rest/api/3/myself", return_headers=True)
         return dict(r.headers), r.status_code
 
-st.title("Jira Stichwort-Zuordnung — PRO v4 (Cloud)")
+# ----------------------------- App Header -----------------------------
+st.title("Jira Stichwort-Zuordnung — PRO v4.1 (Cloud)")
 st.caption("Per-User-Login (Cookie+DB) • Timesheet • Health-Check+ • Multi-Tab • Multi-Projekt")
 
 for k in ["jira","myself","site_url","sidebar_collapsed","timesheet","undo","projects_cache","own_only_prev"]: 
     st.session_state.setdefault(k, None)
 
+# ----------------------------- Auto-Connect via Cookie (nach Warmup) -----------------------------
 if not st.session_state.get("jira"):
     aid = get_user_cookie()
     if aid:
@@ -176,7 +202,9 @@ if not st.session_state.get("jira"):
                 st.session_state.sidebar_collapsed=True
             except Exception as e:
                 st.sidebar.warning("Auto-Login fehlgeschlagen – bitte neu anmelden.")
+# ------------------------------------------------------------------------------------------------
 
+# ----------------------------- Login Sidebar -----------------------------
 st.sidebar.header("Anmeldung (pro Benutzer)")
 base_url  = st.sidebar.text_input("Jira Base-URL", value="")
 email     = st.sidebar.text_input("E-Mail", value="")
@@ -186,6 +214,7 @@ colL, colR = st.sidebar.columns(2)
 connect = colL.button("Verbinden")
 logout  = colR.button("Logout")
 
+# Device/Credential controls
 colA, colB = st.sidebar.columns(2)
 forget_device = colA.button("Dieses Gerät vergessen")
 delete_saved  = colB.button("Gespeicherte Daten löschen")
@@ -223,9 +252,12 @@ if logout:
         st.session_state[k]=None
     st.rerun()
 
+# --- Erst hier stoppen, falls nicht verbunden ---
 if not st.session_state.get("jira"):
     st.stop()
+# ------------------------------------------------
 
+# Sidebar collapse
 def hide_sidebar_css():
     st.markdown("""<style>[data-testid="stSidebar"]{display:none!important}.block-container{padding-top:1rem}</style>""", unsafe_allow_html=True)
 if st.session_state.get("sidebar_collapsed", False):
@@ -236,6 +268,7 @@ else:
 
 jira=st.session_state.jira; me=st.session_state.myself; site_url=st.session_state.site_url
 
+# ----------------------------- Projekte ----------------------------
 def _invalidate_projects():
     st.session_state.projects_cache=None
 
@@ -266,6 +299,7 @@ else:
 
 st.markdown("—")
 
+# ----------------------------- Daten laden -------------------------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.DataFrame:
     if isinstance(project_keys, str): project_keys=[project_keys]
@@ -289,10 +323,12 @@ def refresh_after_update():
 
 df = fetch_issues_df(jira, selected_keys, site_url)
 
+# ----------------------------- Tabs -------------------------------
 tab_overview, tab_plabel, tab_worklog, tab_csv, tab_reports, tab_timesheet, tab_health = st.tabs(
     ["📋 Übersicht","🏷️ P-Labels","⏱️ Worklog (Einzeln)","📥 CSV-Import","📊 Reports & Export","🗓️ Timesheet","🩺 Health-Check+"]
 )
 
+# ----------------------------- Übersicht --------------------------
 from collections import Counter
 with tab_overview:
     st.subheader("Übersicht & Filter")
@@ -335,7 +371,6 @@ with tab_overview:
     qa_date=colqa3.date_input("Datum", value=datetime.now().date(), key="qa_date")
 
     if not df_view.empty and qa_key:
-        proj_of_issue=df_view.loc[df_view["Key"]==qa_key,"Project"].iloc[0]
         p_val=df_view.loc[df_view["Key"]==qa_key,"P_Label_Aktuell"].iloc[0]
         summ=df_view.loc[df_view["Key"]==qa_key,"Summary"].iloc[0]
         qa_desc=fill_template("", p_val, qa_key, summ, qa_date)
@@ -355,6 +390,7 @@ with tab_overview:
     if cq2.button("+30m", key="qa_30"): quick_add(30)
     if cq3.button("+1h",  key="qa_60"): quick_add(60)
 
+# ----------------------------- P-Labels ----------------------------
 with tab_plabel:
     st.subheader("P-Label Zuweisung (Dry-Run möglich)")
     df_scope=df if st.session_state.multi_proj else (df[df["Project"]==selected_keys[0]] if selected_keys else df)
@@ -404,6 +440,7 @@ with tab_plabel:
                     except Exception as e: st.error(f"{k}: {e}")
                 st.session_state.undo={"type":"labels","data":prev}; st.success(f"P {p_number} auf {len(target)} Ticket(s) angewandt."); refresh_after_update()
 
+# ----------------------------- Worklog (Einzeln) -------------------
 with tab_worklog:
     st.subheader("Worklog (Einzel)")
     csel1,csel2=st.columns([2,1])
@@ -429,12 +466,13 @@ with tab_worklog:
                 st.session_state.undo={"type":"worklogs","data":[(use_key,wid)]}; st.success(f"Worklog für {use_key} erfasst.")
             except Exception as e: st.error(f"Fehler: {e}")
 
+# ----------------------------- CSV Import --------------------------
 with tab_csv:
     st.subheader("CSV-Import Zeiterfassung")
-    st.caption("Spalten: **Ticketnummer;Datum;benötigte Zeit in h** | optional: **Uhrzeit, Beschreibung**")
+    st.caption("Spalten: **Ticketnummer;Datum;benötigte Zeit in h** | optional: **Uhrzeit, Beschreibung** | Dezimal: `.` oder `,`")
     sample="Ticketnummer;Datum;benötigte Zeit in h;Uhrzeit;Beschreibung\nPROJ-101;21.08.2025;0,25;12:30;Daily Standup\nPROJ-202;21.08.2025;1.5;09:00;Konzept & Abstimmung\n"
     st.download_button("Beispiel-CSV herunterladen", data=sample.encode("utf-8"), file_name="worklog_beispiel.csv", mime="text/csv", key="csv_sample")
-    default_desc=st.text_input("Standardbeschreibung (optional)", key="csv_default_desc")
+    default_desc=st.text_input("Standardbeschreibung (optional, wenn CSV keine Spalte 'Beschreibung' enthält)", key="csv_default_desc")
     dry_run=st.checkbox("Nur validieren (Dry-Run)", value=True, key="csv_dryrun")
     uploaded=st.file_uploader("CSV hochladen", type=["csv"], key="csv_upload")
 
@@ -449,7 +487,7 @@ with tab_csv:
             return None
         col_ticket=find_col("ticketnummer","ticket","issue","key")
         col_date=find_col("datum","date")
-        col_hours=find_col("benötigte zeit in h","benoetigte zeit in h","hours")
+        col_hours=find_col("benötigte zeit in h","benoetigte zeit in h","hours","dauer(h)","zeit(h)")
         col_time=find_col("uhrzeit","zeit","startzeit")
         col_desc=find_col("beschreibung","description","kommentar")
 
@@ -495,6 +533,7 @@ with tab_csv:
                             for e in errs: st.write(e)
                     if created: st.session_state.undo={"type":"worklogs","data":created}
 
+# ----------------------------- Reports -----------------------------
 with tab_reports:
     st.subheader("Reports & Export")
     colr1,colr2=st.columns(2)
@@ -505,6 +544,7 @@ with tab_reports:
         st.markdown("**Export Übersicht**")
         st.download_button("CSV herunterladen", data=df.to_csv(index=False).encode("utf-8"), file_name="tickets_uebersicht.csv", mime="text/csv", key="rep_csv")
 
+# ----------------------------- Timesheet --------------------------
 with tab_timesheet:
     st.subheader("Wochenansicht / Timesheet")
     today=datetime.now().date()
@@ -514,7 +554,8 @@ with tab_timesheet:
     if colts3.button("Nächste Woche ›", key="ts_next"): st.session_state.ts_date=wk_date + timedelta(days=7); st.rerun()
     mine_only=colts4.toggle("Nur eigene Worklogs", value=True, key="ts_mine")
 
-    week_start,_=week_bounds_from(wk_date); days=[week_start+timedelta(days=i) for i in range(7)]
+    week_start,_=week_bounds_from(wk_date); days=[week_start+timedelta(days=7*i//7) for i in range(7)]  # safer construction
+    days=[week_start+timedelta(days=i) for i in range(7)]
     day_cols=[d.strftime("%a\n%d.%m") for d in days]; st.caption(f"Kalenderwoche: {week_start.isoformat()} bis {(week_start+timedelta(days=6)).isoformat()}")
 
     if st.button("Zeiten laden", key="ts_load"):
@@ -563,6 +604,7 @@ with tab_timesheet:
         st.dataframe(df_ts, use_container_width=True, hide_index=True)
         st.download_button("Timesheet (CSV) herunterladen", data=df_ts.to_csv(index=False).encode("utf-8"), file_name=f"timesheet_{week_start.isoformat()}.csv", mime="text/csv", key="ts_export_csv")
 
+# ----------------------------- Health-Check+ -----------------------
 with tab_health:
     st.subheader("Health-Check+")
     ok_msgs=[]; warn_msgs=[]
@@ -585,6 +627,7 @@ with tab_health:
     st.success("✔ " + "\n\n✔ ".join(ok_msgs))
     if warn_msgs: st.warning("⚠ " + "\n\n⚠ ".join(warn_msgs))
 
+# ----------------------------- Undo -------------------------------
 st.markdown("---")
 if st.session_state.get("undo"):
     u=st.session_state["undo"]
