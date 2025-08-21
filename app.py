@@ -614,8 +614,7 @@ with tab_plabel:
             "Auswählen": st.column_config.CheckboxColumn(help="Ticket in Aktion einschließen"),
             "P_Label_Aktuell": st.column_config.TextColumn("P‑Label"),
         },
-        key="pl_editor",
-    )
+        key="pl_editor")
 
     selection_keys = edited.loc[edited["Auswählen"]==True, "Key"].tolist()
     colp1, colp2 = st.columns([2,1])
