@@ -1,10 +1,3 @@
-
-
-# ---- Cached Jira client factory ----
-@st.cache_resource(show_spinner=False)
-def get_jira_client(base_url: str, email: str, api_token: str):
-    # Caches the client per unique credential tuple to avoid repeated logins
-    return JiraClientBasic(base_url, email, api_token)
 # app.py — Jira Stichwort-Zuordnung PRO v6.2
 # Änderungen ggü. v6.1:
 # - Übersicht: "Schnellaktionen" entfernt
@@ -24,6 +17,13 @@ from sqlalchemy import create_engine, text
 from cryptography.fernet import Fernet
 import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
+
+
+# ---- Cached Jira client factory ----
+@st.cache_resource(show_spinner=False)
+def get_jira_client(base_url: str, email: str, api_token: str):
+    # Caches the client per unique credential tuple to avoid repeated logins
+    return JiraClientBasic(base_url, email, api_token)
 
 st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v6.2 (SSO+PIN)", layout="wide")
 
