@@ -1,3 +1,10 @@
+
+
+# ---- Cached Jira client factory ----
+@st.cache_resource(show_spinner=False)
+def get_jira_client(base_url: str, email: str, api_token: str):
+    # Caches the client per unique credential tuple to avoid repeated logins
+    return JiraClientBasic(base_url, email, api_token)
 # app.py — Jira Stichwort-Zuordnung PRO v6.2
 # Änderungen ggü. v6.1:
 # - Übersicht: "Schnellaktionen" entfernt
@@ -76,6 +83,20 @@ def normalize_base_url(url: str) -> str:
     return url[:-1] if url.endswith("/") else url
 
 class JiraError(Exception): pass
+
+    def batch_update_issue_labels(self, updates: Dict[str, List[str]], chunk_size: int = 20):
+        """Update Labels für mehrere Tickets, in Chunks (schont RateLimit)."""
+        errs = []
+        keys = list(updates.keys())
+        for i in range(0, len(keys), chunk_size):
+            for k in keys[i:i+chunk_size]:
+                try:
+                    self.update_issue_labels(k, updates[k])
+                except Exception as e:
+                    errs.append(f"{k}: {e}")
+            if i+chunk_size < len(keys):
+                time.sleep(1)  # kleine Pause zwischen Chunks
+        return errs
 
 class JiraClientBasic:
     def __init__(self, base_url, email, api_token, timeout=30):
@@ -468,7 +489,11 @@ if login_mode == "Schnell-Login (E-Mail + PIN)":
             salt, enc_token, base_url, account_id = row
             try:
                 f = fernet_from_pin(pin, salt); api_token = f.decrypt(enc_token.encode()).decode()
-                jira = JiraClientBasic(base_url, email, api_token); me = jira.get_myself()
+                @st.cache_resource(ttl=3600)
+def get_jira(base_url, email, api_token):
+    return JiraClientBasic(base_url, email, api_token)
+
+jira = get_jira(base_url, email, api_token); me = jira.get_myself()
                 st.session_state.jira, st.session_state.myself, st.session_state.site_url = jira, me, base_url
                 st.session_state.sidebar_collapsed=True; st.sidebar.success(f"Verbunden als: {me.get('displayName')}")
             except Exception as e: st.sidebar.error(f"PIN oder Daten ungültig: {e}")
@@ -546,6 +571,29 @@ else:
 st.markdown("—")
 
 @st.cache_data(ttl=120, show_spinner=False)
+
+
+# ---- Chunked label updater to be gentle on API limits ----
+def apply_labels_chunked(jira, rows, *, chunk_size: int = 25, delay_sec: float = 0.1):
+    """rows: list of dicts with keys 'Key', 'Neu', 'Alt' (strings with comma-separated labels)."""
+    errs = []
+    prev_state = {}
+    total = max(len(rows), 1)
+    prog = st.progress(0, text="Änderungen werden angewendet…")
+    for i, row in enumerate(rows, start=1):
+        k = row.get('Key')
+        old = [x.strip() for x in (row.get('Alt') or '').split(',') if x.strip()]
+        new = [x.strip() for x in (row.get('Neu') or '').split(',') if x.strip()]
+        prev_state[k] = old
+        try:
+            jira.update_issue_labels(k, new)
+        except Exception as e:
+            errs.append(f"{k}: {e}")
+        if i % chunk_size == 0:
+            time.sleep(delay_sec)
+        prog.progress(i/total, text=f"{i}/{total} aktualisiert…")
+    prog.empty()
+    return prev_state, errs
 def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.DataFrame:
     if isinstance(project_keys, str): project_keys=[project_keys]
     if not project_keys: 
@@ -636,6 +684,8 @@ with tab_overview:
 # ----------------------------- P-Labels (Hauptbereich) ------------
 
 with tab_plabel:
+    with st.form('plabel_form'):
+
     st.subheader("P‑Labels zuweisen")
     st.caption("Wähle Tickets in der Tabelle aus **oder** nutze 'Alle in aktueller Ansicht'. Änderungen werden zuerst als Vorschau gezeigt.")
 
@@ -722,6 +772,8 @@ with tab_plabel:
         if cprev2.button("Abbrechen", key="pl_cancel"):
             st.session_state.pl_preview = None
             st.info("Vorschau verworfen.")
+
+        st.form_submit_button('Änderungen übernehmen')
 
 with tab_worklog:
     st.subheader("Worklog (Einzel)")
@@ -1076,7 +1128,7 @@ if st.session_state.get("undo"):
                 try: jira.update_issue_labels(k, old)
                 except Exception as e: errs.append(f"{k}: {e}")
             st.session_state.undo=None; st.success("Label-Änderung rückgängig gemacht."); 
-            fetch_issues_df.clear(); st.query_params['_'] = str(time.time()); st.rerun()
+            fetch_issues_df.clear(); # (removed) stale busting via query params not needed with cache
     elif u["type"]=="worklogs":
         if st.button("↩️ Letzte Worklogs rückgängig machen", key="undo_wl"):
             errs=[]
