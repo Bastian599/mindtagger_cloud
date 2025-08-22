@@ -84,19 +84,6 @@ def normalize_base_url(url: str) -> str:
 
 class JiraError(Exception): pass
 
-    def batch_update_issue_labels(self, updates: Dict[str, List[str]], chunk_size: int = 20):
-        """Update Labels für mehrere Tickets, in Chunks (schont RateLimit)."""
-        errs = []
-        keys = list(updates.keys())
-        for i in range(0, len(keys), chunk_size):
-            for k in keys[i:i+chunk_size]:
-                try:
-                    self.update_issue_labels(k, updates[k])
-                except Exception as e:
-                    errs.append(f"{k}: {e}")
-            if i+chunk_size < len(keys):
-                time.sleep(1)  # kleine Pause zwischen Chunks
-        return errs
 
 class JiraClientBasic:
     def __init__(self, base_url, email, api_token, timeout=30):
@@ -489,11 +476,7 @@ if login_mode == "Schnell-Login (E-Mail + PIN)":
             salt, enc_token, base_url, account_id = row
             try:
                 f = fernet_from_pin(pin, salt); api_token = f.decrypt(enc_token.encode()).decode()
-                @st.cache_resource(ttl=3600)
-def get_jira(base_url, email, api_token):
-    return JiraClientBasic(base_url, email, api_token)
-
-jira = get_jira(base_url, email, api_token); me = jira.get_myself()
+                jira = get_jira_client(base_url, email, api_token); me = jira.get_myself()
                 st.session_state.jira, st.session_state.myself, st.session_state.site_url = jira, me, base_url
                 st.session_state.sidebar_collapsed=True; st.sidebar.success(f"Verbunden als: {me.get('displayName')}")
             except Exception as e: st.sidebar.error(f"PIN oder Daten ungültig: {e}")
@@ -684,7 +667,6 @@ with tab_overview:
 # ----------------------------- P-Labels (Hauptbereich) ------------
 
 with tab_plabel:
-    with st.form('plabel_form'):
 
     st.subheader("P‑Labels zuweisen")
     st.caption("Wähle Tickets in der Tabelle aus **oder** nutze 'Alle in aktueller Ansicht'. Änderungen werden zuerst als Vorschau gezeigt.")
@@ -751,30 +733,27 @@ with tab_plabel:
         df_prev = pd.DataFrame(st.session_state.pl_preview["rows"])
         st.dataframe(df_prev, use_container_width=True, hide_index=True)
         cprev1, cprev2 = st.columns([1,1])
-        if cprev1.button("✅ Bestätigen & Anwenden", key="pl_apply"):
-            p_val = st.session_state.pl_preview["p"]; prev_state = {}; errs = []
-            for row in st.session_state.pl_preview["rows"]:
-                k = row["Key"]
-                old = [x.strip() for x in row["Alt"].split(",")] if row["Alt"] else []
-                prev_state[k] = old
-                new = [x.strip() for x in row["Neu"].split(",")] if row["Neu"] else []
-                try:
-                    jira.update_issue_labels(k, new)
-                except Exception as e:
-                    errs.append(f"{k}: {e}")
-            st.session_state.undo = {"type":"labels","data":prev_state}
-            st.session_state.pl_preview = None
-            if errs:
-                st.error("Einige Tickets konnten nicht aktualisiert werden:\n- " + "\n- ".join(errs))
-            else:
-                st.success(f"P‑Label `{p_val}` angewandt.")
-            refresh_after_update()
-        if cprev2.button("Abbrechen", key="pl_cancel"):
-            st.session_state.pl_preview = None
-            st.info("Vorschau verworfen.")
-
-        st.form_submit_button('Änderungen übernehmen')
-
+with st.form(key="pl_apply_form"):
+    st.caption("Bestätige, um die Änderungen endgültig zu übernehmen.")
+    col_a, col_b, col_c = st.columns([1,1,1])
+    chunk_sz = col_a.number_input("Batch-Größe", min_value=5, max_value=100, value=25, step=5)
+    delay_val = col_b.number_input("Verzögerung pro Batch (Sek.)", min_value=0.0, max_value=5.0, value=0.12, step=0.02)
+    retries = col_c.number_input("Max. Retries", min_value=0, max_value=5, value=2, step=1)
+    submit_apply = st.form_submit_button("✅ Bestätigen & Anwenden")
+if submit_apply:
+    rows_appl = st.session_state.pl_preview["rows"]
+    p_val = st.session_state.pl_preview["p"]
+    prev_state, errs = apply_labels_chunked(jira, rows_appl, chunk_size=int(chunk_sz), delay_sec=float(delay_val), retries=int(retries))
+    st.session_state.undo = {"type":"labels","data": list(prev_state.items())}
+    st.session_state.pl_preview = None
+    if errs:
+        st.error("Einige Tickets konnten nicht aktualisiert werden:\n- " + "\n- ".join(errs))
+        st.success(f"P‑Label `{p_val}` angewandt.")
+    fetch_issues_df.clear()
+    st.rerun()
+if cprev2.button("Abbrechen", key="pl_cancel"):
+    st.session_state.pl_preview = None
+    st.info("Vorschau verworfen.")
 with tab_worklog:
     st.subheader("Worklog (Einzel)")
     csel1,csel2=st.columns([2,1])
