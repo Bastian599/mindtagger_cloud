@@ -619,7 +619,6 @@ def refresh_after_update():
     except Exception:
         pass
     st.rerun()
-
 df = fetch_issues_df(jira, selected_keys, site_url)
 
 # ----------------------------- Tabs -------------------------------
@@ -740,7 +739,7 @@ with st.form(key="pl_apply_form"):
     delay_val = col_b.number_input("Verzögerung pro Batch (Sek.)", min_value=0.0, max_value=5.0, value=0.12, step=0.02)
     retries = col_c.number_input("Max. Retries", min_value=0, max_value=5, value=2, step=1)
     submit_apply = st.form_submit_button("✅ Bestätigen & Anwenden")
-if submit_apply:
+if submit_apply and st.session_state.get("pl_preview"):
     rows_appl = st.session_state.pl_preview["rows"]
     p_val = st.session_state.pl_preview["p"]
     prev_state, errs = apply_labels_chunked(jira, rows_appl, chunk_size=int(chunk_sz), delay_sec=float(delay_val), retries=int(retries))
@@ -748,9 +747,13 @@ if submit_apply:
     st.session_state.pl_preview = None
     if errs:
         st.error("Einige Tickets konnten nicht aktualisiert werden:\n- " + "\n- ".join(errs))
+    else:
         st.success(f"P‑Label `{p_val}` angewandt.")
     fetch_issues_df.clear()
     st.rerun()
+else:
+    if submit_apply:
+        st.warning("Keine Vorschau vorhanden – bitte erst eine Vorschau erzeugen.")
 if st.session_state.pl_preview and st.button("Abbrechen", key="pl_cancel"):
     st.session_state.pl_preview = None
     st.info("Vorschau verworfen.")
