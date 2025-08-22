@@ -557,7 +557,7 @@ st.markdown("—")
 
 
 # ---- Chunked label updater to be gentle on API limits ----
-def apply_labels_chunked(jira, rows, *, chunk_size: int = 25, delay_sec: float = 0.1):
+def apply_labels_chunked(_jira, rows, *, chunk_size: int = 25, delay_sec: float = 0.1):
     """rows: list of dicts with keys 'Key', 'Neu', 'Alt' (strings with comma-separated labels)."""
     errs = []
     prev_state = {}
@@ -569,7 +569,7 @@ def apply_labels_chunked(jira, rows, *, chunk_size: int = 25, delay_sec: float =
         new = [x.strip() for x in (row.get('Neu') or '').split(',') if x.strip()]
         prev_state[k] = old
         try:
-            jira.update_issue_labels(k, new)
+            _jira.update_issue_labels(k, new)
         except Exception as e:
             errs.append(f"{k}: {e}")
         if i % chunk_size == 0:
@@ -1107,7 +1107,7 @@ if st.session_state.get("undo"):
         if st.button("↩️ Letzte Label-Änderung rückgängig machen", key="undo_labels"):
             prev=u["data"]; errs=[]
             for k,old in prev.items():
-                try: jira.update_issue_labels(k, old)
+                try: _jira.update_issue_labels(k, old)
                 except Exception as e: errs.append(f"{k}: {e}")
             st.session_state.undo=None; st.success("Label-Änderung rückgängig gemacht."); 
             fetch_issues_df.clear(); # (removed) stale busting via query params not needed with cache
