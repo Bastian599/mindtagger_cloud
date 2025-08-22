@@ -619,7 +619,7 @@ with tab_overview:
     c4.write("Empf. Projektnummer: " + (f"`{suggested_p}`" if suggested_p else "—"))
 
     st.dataframe(df_view, use_container_width=True, hide_index=True, column_config={
-        "Ticket": st.column_config.LinkColumn("Ticket öffnen", display_text="Open"),
+        "Ticket": st.column_config.LinkColumn("Ticket öffnen", display_text="Zum Ticket"),
         "Project": st.column_config.TextColumn("Projekt"),
         "Key": st.column_config.TextColumn("Key"),
         "Summary": st.column_config.TextColumn("Summary"),
