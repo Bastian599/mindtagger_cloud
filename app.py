@@ -751,7 +751,7 @@ if submit_apply:
         st.success(f"P‑Label `{p_val}` angewandt.")
     fetch_issues_df.clear()
     st.rerun()
-if cprev2.button("Abbrechen", key="pl_cancel"):
+if st.session_state.pl_preview and st.button("Abbrechen", key="pl_cancel"):
     st.session_state.pl_preview = None
     st.info("Vorschau verworfen.")
 with tab_worklog:
