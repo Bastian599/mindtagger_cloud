@@ -18,13 +18,6 @@ from cryptography.fernet import Fernet
 import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
 
-
-# ---- Cached Jira client factory ----
-@st.cache_resource(show_spinner=False)
-def get_jira_client(base_url: str, email: str, api_token: str):
-    # Caches the client per unique credential tuple to avoid repeated logins
-    return JiraClientBasic(base_url, email, api_token)
-
 st.set_page_config(page_title="Jira Stichwort-Zuordnung — PRO v6.2 (SSO+PIN)", layout="wide")
 
 # ----------------------------- Secrets & DB -----------------------------
@@ -83,7 +76,6 @@ def normalize_base_url(url: str) -> str:
     return url[:-1] if url.endswith("/") else url
 
 class JiraError(Exception): pass
-
 
 class JiraClientBasic:
     def __init__(self, base_url, email, api_token, timeout=30):
@@ -476,7 +468,7 @@ if login_mode == "Schnell-Login (E-Mail + PIN)":
             salt, enc_token, base_url, account_id = row
             try:
                 f = fernet_from_pin(pin, salt); api_token = f.decrypt(enc_token.encode()).decode()
-                jira = get_jira_client(base_url, email, api_token); me = jira.get_myself()
+                jira = JiraClientBasic(base_url, email, api_token); me = jira.get_myself()
                 st.session_state.jira, st.session_state.myself, st.session_state.site_url = jira, me, base_url
                 st.session_state.sidebar_collapsed=True; st.sidebar.success(f"Verbunden als: {me.get('displayName')}")
             except Exception as e: st.sidebar.error(f"PIN oder Daten ungültig: {e}")
@@ -554,29 +546,6 @@ else:
 st.markdown("—")
 
 @st.cache_data(ttl=120, show_spinner=False)
-
-
-# ---- Chunked label updater to be gentle on API limits ----
-def apply_labels_chunked(_jira, rows, *, chunk_size: int = 25, delay_sec: float = 0.1):
-    """rows: list of dicts with keys 'Key', 'Neu', 'Alt' (strings with comma-separated labels)."""
-    errs = []
-    prev_state = {}
-    total = max(len(rows), 1)
-    prog = st.progress(0, text="Änderungen werden angewendet…")
-    for i, row in enumerate(rows, start=1):
-        k = row.get('Key')
-        old = [x.strip() for x in (row.get('Alt') or '').split(',') if x.strip()]
-        new = [x.strip() for x in (row.get('Neu') or '').split(',') if x.strip()]
-        prev_state[k] = old
-        try:
-            _jira.update_issue_labels(k, new)
-        except Exception as e:
-            errs.append(f"{k}: {e}")
-        if i % chunk_size == 0:
-            time.sleep(delay_sec)
-        prog.progress(i/total, text=f"{i}/{total} aktualisiert…")
-    prog.empty()
-    return prev_state, errs
 def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.DataFrame:
     if isinstance(project_keys, str): project_keys=[project_keys]
     if not project_keys: 
@@ -614,11 +583,8 @@ def fetch_issues_df(_jira_client, project_keys: List[str], site_url: str) -> pd.
     return pd.DataFrame(rows)
 
 def refresh_after_update():
-    try:
-        fetch_issues_df.clear()
-    except Exception:
-        pass
-    st.rerun()
+    fetch_issues_df.clear(); st.query_params['_'] = str(time.time()); st.rerun()
+
 df = fetch_issues_df(jira, selected_keys, site_url)
 
 # ----------------------------- Tabs -------------------------------
@@ -666,7 +632,6 @@ with tab_overview:
 # ----------------------------- P-Labels (Hauptbereich) ------------
 
 with tab_plabel:
-
     st.subheader("P‑Labels zuweisen")
     st.caption("Wähle Tickets in der Tabelle aus **oder** nutze 'Alle in aktueller Ansicht'. Änderungen werden zuerst als Vorschau gezeigt.")
 
@@ -732,31 +697,28 @@ with tab_plabel:
         df_prev = pd.DataFrame(st.session_state.pl_preview["rows"])
         st.dataframe(df_prev, use_container_width=True, hide_index=True)
         cprev1, cprev2 = st.columns([1,1])
-with st.form(key="pl_apply_form"):
-    st.caption("Bestätige, um die Änderungen endgültig zu übernehmen.")
-    col_a, col_b, col_c = st.columns([1,1,1])
-    chunk_sz = col_a.number_input("Batch-Größe", min_value=5, max_value=100, value=25, step=5)
-    delay_val = col_b.number_input("Verzögerung pro Batch (Sek.)", min_value=0.0, max_value=5.0, value=0.12, step=0.02)
-    retries = col_c.number_input("Max. Retries", min_value=0, max_value=5, value=2, step=1)
-    submit_apply = st.form_submit_button("✅ Bestätigen & Anwenden")
-if submit_apply and st.session_state.get("pl_preview"):
-    rows_appl = st.session_state.pl_preview["rows"]
-    p_val = st.session_state.pl_preview["p"]
-    prev_state, errs = apply_labels_chunked(jira, rows_appl, chunk_size=int(chunk_sz), delay_sec=float(delay_val), retries=int(retries))
-    st.session_state.undo = {"type":"labels","data": list(prev_state.items())}
-    st.session_state.pl_preview = None
-    if errs:
-        st.error("Einige Tickets konnten nicht aktualisiert werden:\n- " + "\n- ".join(errs))
-    else:
-        st.success(f"P‑Label `{p_val}` angewandt.")
-    fetch_issues_df.clear()
-    st.rerun()
-else:
-    if submit_apply:
-        st.warning("Keine Vorschau vorhanden – bitte erst eine Vorschau erzeugen.")
-if st.session_state.pl_preview and st.button("Abbrechen", key="pl_cancel"):
-    st.session_state.pl_preview = None
-    st.info("Vorschau verworfen.")
+        if cprev1.button("✅ Bestätigen & Anwenden", key="pl_apply"):
+            p_val = st.session_state.pl_preview["p"]; prev_state = {}; errs = []
+            for row in st.session_state.pl_preview["rows"]:
+                k = row["Key"]
+                old = [x.strip() for x in row["Alt"].split(",")] if row["Alt"] else []
+                prev_state[k] = old
+                new = [x.strip() for x in row["Neu"].split(",")] if row["Neu"] else []
+                try:
+                    jira.update_issue_labels(k, new)
+                except Exception as e:
+                    errs.append(f"{k}: {e}")
+            st.session_state.undo = {"type":"labels","data":prev_state}
+            st.session_state.pl_preview = None
+            if errs:
+                st.error("Einige Tickets konnten nicht aktualisiert werden:\n- " + "\n- ".join(errs))
+            else:
+                st.success(f"P‑Label `{p_val}` angewandt.")
+            refresh_after_update()
+        if cprev2.button("Abbrechen", key="pl_cancel"):
+            st.session_state.pl_preview = None
+            st.info("Vorschau verworfen.")
+
 with tab_worklog:
     st.subheader("Worklog (Einzel)")
     csel1,csel2=st.columns([2,1])
@@ -1107,10 +1069,10 @@ if st.session_state.get("undo"):
         if st.button("↩️ Letzte Label-Änderung rückgängig machen", key="undo_labels"):
             prev=u["data"]; errs=[]
             for k,old in prev.items():
-                try: _jira.update_issue_labels(k, old)
+                try: jira.update_issue_labels(k, old)
                 except Exception as e: errs.append(f"{k}: {e}")
             st.session_state.undo=None; st.success("Label-Änderung rückgängig gemacht."); 
-            fetch_issues_df.clear(); # (removed) stale busting via query params not needed with cache
+            fetch_issues_df.clear(); st.query_params['_'] = str(time.time()); st.rerun()
     elif u["type"]=="worklogs":
         if st.button("↩️ Letzte Worklogs rückgängig machen", key="undo_wl"):
             errs=[]
