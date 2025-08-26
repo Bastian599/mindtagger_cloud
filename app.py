@@ -1066,7 +1066,7 @@ st.markdown("---")
 if st.session_state.get("undo"):
     u=st.session_state["undo"]
     if u["type"]=="labels":
-        if st.button("↩️ Letzte Label-Änderung rückgängig machen", key="undo_labels"):
+        if st.button("↩️ Letzte Label-Änderung rückgängig machen.", key="undo_labels"):
             prev=u["data"]; errs=[]
             for k,old in prev.items():
                 try: jira.update_issue_labels(k, old)
